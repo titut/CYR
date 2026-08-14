@@ -190,6 +190,11 @@ class Navigator:
 
         self._nav_target = target
         self._current_path = []
+
+        # New goal means a fresh world model: unknown dynamic obstacles from a
+        # previous navigation should not poison this plan.
+        self._reset_dynamic_obstacles_and_grid()
+
         logging.info("Goal received: (%.1f, %.1f) px", target[0], target[1])
         # Force-publish the new plan (even empty) because the old path, if any,
         # leads to a different goal.
@@ -208,6 +213,10 @@ class Navigator:
             if target_px is not None:
                 self._nav_target = target_px
                 self._current_path = []
+
+                # See _on_goal: brand-new goal starts with a clean grid.
+                self._reset_dynamic_obstacles_and_grid()
+
                 logging.info(
                     "LLM resolved to: (%.1f, %.1f) px",
                     target_px[0],
@@ -440,6 +449,21 @@ class Navigator:
         for key in self._confirmed_obstacle_keys:
             cx, cy = self._dynamic_obstacles[key]["center"]
             self.occ_grid.mark_circle(cx, cy, clearance_px)
+
+    def _reset_dynamic_obstacles_and_grid(self) -> None:
+        """Clear all dynamic obstacle state and rebuild the occupancy grid
+        from walls only.
+
+        Called when a brand-new navigation goal is received so every new goal
+        starts from the same clean world model as the first navigation.
+        Dynamic obstacles will be re-detected and re-added if they block the
+        new path.
+        """
+        self._dynamic_obstacles = {}
+        self._confirmed_obstacle_keys = set()
+        self.occ_grid = OccupancyGrid.from_walls(
+            self.map_data.walls, self._grid_resolution_px
+        )
 
     def _repair_path(self) -> bool:
         """Repair the current path by keeping the prefix up to the blockage and
