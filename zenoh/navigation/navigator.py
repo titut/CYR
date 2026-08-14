@@ -189,6 +189,7 @@ class Navigator:
             return
 
         self._nav_target = target
+        self._current_path = []
         logging.info("Goal received: (%.1f, %.1f) px", target[0], target[1])
         # Force-publish the new plan (even empty) because the old path, if any,
         # leads to a different goal.
@@ -206,6 +207,7 @@ class Navigator:
         def _on_result(target_px: Optional[Tuple[float, float]]):
             if target_px is not None:
                 self._nav_target = target_px
+                self._current_path = []
                 logging.info(
                     "LLM resolved to: (%.1f, %.1f) px",
                     target_px[0],
