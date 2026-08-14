@@ -480,21 +480,183 @@ class Navigator:
             return False
 
         # Stop the robot while a new path is being computed.
-        self._current_path = []
         self._pub_path.put(json.dumps([]))
         logging.info("Published empty path while replanning.")
 
         # Determine the first waypoint on the current path that is ahead of the
         # robot. We start the repaired path at the robot's estimated pose.
-        start_idx = self._current_path_index()  # NOTE: _current_path is now empty
-        # Because _current_path is empty, _current_path_index returns 0.
-        # We need to retain the old blocked index information before clearing.
-        # The old path information is lost, so fall back to full replan from current pose.
-        # This is safe: we already stopped the robot.
-        return self._plan_and_publish()
+        start_idx = self._current_path_index()
 
-        # The code below is unreachable but retained for clarity; it is never
-        # executed after the above full replan.
-        # safe_idx = max(start_idx, blocked_idx - 1)
-        # safe_point = self._current_path[safe_idx]
-        # ...
+        # The waypoint just before the blocked segment. Never go earlier than
+        # the robot's current progress, so we do not ask the robot to reverse.
+        safe_idx = max(start_idx, blocked_idx - 1)
+        safe_point = self._current_path[safe_idx]
+
+        logging.info(
+            "Repairing path from waypoint %d (%.1f, %.1f) onward.",
+            safe_idx,
+            safe_point[0],
+            safe_point[1],
+        )
+
+        suffix = plan_path(
+            self.occ_grid,
+            safe_point,
+            self._nav_target,
+            self._bot_footprint,
+        )
+
+        if not suffix:
+            logging.warning(
+                "Path repair failed from (%.1f, %.1f); falling back to full replan.",
+                safe_point[0],
+                safe_point[1],
+            )
+            return self._plan_and_publish()
+
+        # Build the repaired path: current estimated pose, then the still-valid
+        # waypoints from the current path up to and including safe_point, then
+        # the new suffix (excluding its first point, which is safe_point).
+        current_pose = (self._est_x, self._est_y)
+        prefix = [current_pose] + list(self._current_path[start_idx : safe_idx + 1])
+        suffix_without_start = list(suffix[1:])
+        repaired = prefix + suffix_without_start
+
+        self._current_path = [(float(p[0]), float(p[1])) for p in repaired]
+        msg = json.dumps([[round(p[0], 1), round(p[1], 1)] for p in repaired])
+        self._pub_path.put(msg)
+        logging.info(
+            "Published repaired path with %d waypoints (prefix=%d, suffix=%d).",
+            len(repaired),
+            len(prefix),
+            len(suffix_without_start),
+        )
+        return True
+
+    def _check_and_replan(self):
+        """Detect obstacles, confirm them over time, decay stale ones, and replan.
+
+        Obstacles are only marked on the grid after being observed multiple
+        times; this suppresses single-scan ghosts caused by pose errors.
+        Confirmed obstacles that are no longer observed decay and are removed,
+        so old false positives do not permanently block the map.
+        """
+        if self._nav_target is None:
+            return
+
+        # If we have a target but no current path (for example an initial plan
+        # failed, or the previous path was cleared), retry planning now instead
+        # of waiting for an obstacle-blocked path event. This ensures a failed
+        # attempt does not permanently stop navigation.
+        if not self._current_path:
+            logging.info(
+                "No current path to target (%.1f, %.1f); attempting to plan.",
+                self._nav_target[0],
+                self._nav_target[1],
+            )
+            self._plan_and_publish()
+
+        centers = self._detect_obstacles()
+        now = time.time()
+        merge_radius_px = _OBSTACLE_MERGE_RADIUS_M / self.scale_m_per_px
+        updated_keys: set = set()
+
+        # Update existing tracks or create new ones for each candidate.
+        for cx, cy in centers:
+            key = self._find_nearest_tracked_obstacle(cx, cy, merge_radius_px)
+            if key is not None:
+                obs = self._dynamic_obstacles[key]
+                n = obs["confidence"]
+                obs["center"] = (
+                    (obs["center"][0] * n + cx) / (n + 1),
+                    (obs["center"][1] * n + cy) / (n + 1),
+                )
+                obs["confidence"] = n + 1
+                obs["last_seen"] = now
+                updated_keys.add(key)
+            else:
+                key = f"{round(cx)}:{round(cy)}:{now:.4f}"
+                self._dynamic_obstacles[key] = {
+                    "center": (cx, cy),
+                    "confidence": 1,
+                    "last_seen": now,
+                }
+                updated_keys.add(key)
+
+        # Decay obstacles that were not updated this scan.
+        for key in list(self._dynamic_obstacles.keys()):
+            if key in updated_keys:
+                continue
+            obs = self._dynamic_obstacles[key]
+            age = now - obs["last_seen"]
+            max_age = (
+                _OBSTACLE_DECAY_AGE_S
+                if obs["confidence"] >= _OBSTACLE_CONFIRM_SCANS
+                else _OBSTACLE_CANDIDATE_DECAY_AGE_S
+            )
+            if age > max_age:
+                del self._dynamic_obstacles[key]
+
+        # Recompute confirmed set.
+        new_confirmed = {
+            key
+            for key, obs in self._dynamic_obstacles.items()
+            if obs["confidence"] >= _OBSTACLE_CONFIRM_SCANS
+        }
+        confirmed_changed = new_confirmed != self._confirmed_obstacle_keys
+        self._confirmed_obstacle_keys = new_confirmed
+
+        if confirmed_changed:
+            self._rebuild_occupancy_grid()
+            logging.info(
+                "Confirmed obstacle set changed (%d confirmed).",
+                len(self._confirmed_obstacle_keys),
+            )
+
+        # Only replan if the remaining path is actually blocked. Rebuilding the
+        # grid on every confirmed-set change keeps the world model up to date,
+        # but there is no need to issue a new plan for obstacles behind the
+        # robot or far from the current route.
+        path_blocked = False
+        for key in self._confirmed_obstacle_keys:
+            cx, cy = self._dynamic_obstacles[key]["center"]
+            if self._obstacle_blocks_remaining_path(cx, cy):
+                logging.info(
+                    "Confirmed obstacle at (%.1f, %.1f) blocks remaining path; replanning.",
+                    cx,
+                    cy,
+                )
+                path_blocked = True
+                break
+
+        if path_blocked:
+            self._repair_path()
+
+    # -------------------------------------------------------------------
+    # Main loop
+    # -------------------------------------------------------------------
+
+    def run(self):
+        print("[navigator] Running. Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(_CHECK_INTERVAL_S)
+                self._check_and_replan()
+        except KeyboardInterrupt:
+            print("[navigator] Stopping…")
+        finally:
+            self._session.close()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main():
+    map_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("test_map.json")
+    Navigator(map_path).run()
+
+
+if __name__ == "__main__":
+    main()
