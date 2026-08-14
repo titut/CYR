@@ -95,20 +95,34 @@ def _find_free_nearby(
 ) -> Optional[Tuple[float, float]]:
     """Return a collision-free point near (x, y), or None if none exists.
 
-    Searches in expanding rings to handle the common case where the start or
-    goal is only slightly inside an inflated obstacle due to pose error.
+    If (x, y) is already free, returns it. Otherwise searches the occupancy
+    grid cells within search_radius_px of the requested point and returns the
+    closest cell centre whose robot footprint is collision-free.
     """
     if _point_collision_free(grid, x, y, half_size_px):
         return (x, y)
 
-    for r in range(5, int(search_radius_px) + 1, 5):
-        for i in range(angle_steps):
-            angle = 2.0 * math.pi * i / angle_steps
-            nx = x + r * math.cos(angle)
-            ny = y + r * math.sin(angle)
-            if _point_collision_free(grid, nx, ny, half_size_px):
-                return (nx, ny)
-    return None
+    center_gx, center_gy = grid.world_to_grid(x, y)
+    radius_cells = int(math.ceil(search_radius_px / grid.resolution))
+
+    best_dist = float("inf")
+    best_point: Optional[Tuple[float, float]] = None
+
+    for dgx in range(-radius_cells, radius_cells + 1):
+        for dgy in range(-radius_cells, radius_cells + 1):
+            gx = center_gx + dgx
+            gy = center_gy + dgy
+            if gx < 0 or gx >= grid.cols or gy < 0 or gy >= grid.rows:
+                continue
+
+            wx, wy = grid.grid_to_world(gx, gy)
+            if _point_collision_free(grid, wx, wy, half_size_px):
+                dist = math.hypot(wx - x, wy - y)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_point = (wx, wy)
+
+    return best_point
 
 
 class _Node:
@@ -414,7 +428,7 @@ def plan_path(
     """
     # Derive robot half-size from the footprint.
     # The footprint's max cell offset already includes the robot radius plus a
-    # 10% safety margin, so converting it back to world units gives the full
+    # safety margin, so converting it back to world units gives the full
     # clearance the planner should respect.
     if footprint:
         max_offset = max(max(abs(dx), abs(dy)) for dx, dy in footprint)
