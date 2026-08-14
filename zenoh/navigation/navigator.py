@@ -375,7 +375,7 @@ class Navigator:
             wx, wy = self._current_path[best_idx]
             nx, ny = self._current_path[best_idx + 1]
             dx_to_robot = self._est_x - wx
-            dy_to_robot = self._est_y - wy
+            dy_to_robot = self._est_x - wy
             dx_path = nx - wx
             dy_path = ny - wy
             if dx_to_robot * dx_path + dy_to_robot * dy_path > 0:
@@ -502,6 +502,18 @@ class Navigator:
         """
         if self._nav_target is None:
             return
+
+        # If we have a target but no current path (for example an initial plan
+        # failed, or the previous path was cleared), retry planning now instead
+        # of waiting for an obstacle-blocked path event. This ensures a failed
+        # attempt does not permanently stop navigation.
+        if not self._current_path:
+            logging.info(
+                "No current path to target (%.1f, %.1f); attempting to plan.",
+                self._nav_target[0],
+                self._nav_target[1],
+            )
+            self._plan_and_publish()
 
         centers = self._detect_obstacles()
         now = time.time()
