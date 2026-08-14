@@ -58,7 +58,7 @@ _OBSTACLE_DETECTION_THRESHOLD_M = 0.3  # residual larger than this = obstacle
 _OBSTACLE_CLUSTER_RADIUS_M = 0.5  # points within this cluster together
 # Detected hit points sit on the obstacle's *near* surface, so we mark a circle
 # big enough to cover the obstacle body plus the robot's radius plus a margin.
-_OBSTACLE_MARK_MARGIN_PX = 10.0  # extra clearance beyond bot radius
+_OBSTACLE_MARK_MARGIN_PX = 3  # extra clearance beyond bot radius
 _CHECK_INTERVAL_S = 0.25  # how often to scan and (maybe) replan
 
 # Dynamic obstacle confirmation / decay.
@@ -422,7 +422,10 @@ class Navigator:
             x2, y2 = self._current_path[i + 1]
             for key in self._confirmed_obstacle_keys:
                 cx, cy = self._dynamic_obstacles[key]["center"]
-                if self._distance_point_to_segment(cx, cy, x1, y1, x2, y2) < clearance_px:
+                if (
+                    self._distance_point_to_segment(cx, cy, x1, y1, x2, y2)
+                    < clearance_px
+                ):
                     return i
         return None
 
