@@ -466,8 +466,9 @@ class Navigator:
         )
 
     def _repair_path(self) -> bool:
-        """Repair the current path by keeping the prefix up to the blockage and
-        planning a new suffix from there to the goal.
+        """Repair the current path by keeping the portion from the robot's
+        current position to just before the blocked segment, planning a new
+        suffix from that safe point to the goal, and publishing the result.
 
         Returns True if a repaired (or fallback) path was published.
         """
@@ -475,22 +476,25 @@ class Navigator:
         if blocked_idx is None:
             return False
 
-        # Back up one waypoint before the blocked segment so the repair start
-        # is not right up against the obstacle.  Never go earlier than the
-        # current path index so we do not ask the robot to reverse.
-        repair_idx = max(self._current_path_index(), blocked_idx - 1)
-        repair_start = self._current_path[repair_idx]
+        # Determine the first waypoint on the current path that is ahead of the
+        # robot. We start the repaired path at the robot's estimated pose.
+        start_idx = self._current_path_index()
+
+        # The waypoint just before the blocked segment. Never go earlier than
+        # the robot's current progress, so we do not ask the robot to reverse.
+        safe_idx = max(start_idx, blocked_idx - 1)
+        safe_point = self._current_path[safe_idx]
 
         logging.info(
             "Repairing path from waypoint %d (%.1f, %.1f) onward.",
-            repair_idx,
-            repair_start[0],
-            repair_start[1],
+            safe_idx,
+            safe_point[0],
+            safe_point[1],
         )
 
         suffix = plan_path(
             self.occ_grid,
-            repair_start,
+            safe_point,
             self._nav_target,
             self._bot_footprint,
         )
@@ -498,22 +502,28 @@ class Navigator:
         if not suffix:
             logging.warning(
                 "Path repair failed from (%.1f, %.1f); falling back to full replan.",
-                repair_start[0],
-                repair_start[1],
+                safe_point[0],
+                safe_point[1],
             )
             return self._plan_and_publish()
 
-        # Build the repaired path starting from the robot's current estimated
-        # pose.  The simulator resets its path index to 0 on every new path,
-        # so including waypoints behind the robot would make it backtrack to
-        # the original origin.  The segment from the current pose to
-        # suffix[0] (the repair start) follows the original route.
+        # Build the repaired path: current estimated pose, then the still-valid
+        # waypoints from the current path up to and including safe_point, then
+        # the new suffix (excluding its first point, which is safe_point).
         current_pose = (self._est_x, self._est_y)
-        repaired = [current_pose] + list(suffix)
+        prefix = [current_pose] + list(self._current_path[start_idx : safe_idx + 1])
+        suffix_without_start = list(suffix[1:])
+        repaired = prefix + suffix_without_start
+
         self._current_path = [(float(p[0]), float(p[1])) for p in repaired]
         msg = json.dumps([[round(p[0], 1), round(p[1], 1)] for p in repaired])
         self._pub_path.put(msg)
-        logging.info("Published repaired path with %d waypoints.", len(repaired))
+        logging.info(
+            "Published repaired path with %d waypoints (prefix=%d, suffix=%d).",
+            len(repaired),
+            len(prefix),
+            len(suffix_without_start),
+        )
         return True
 
     def _check_and_replan(self):
