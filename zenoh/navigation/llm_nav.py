@@ -1,7 +1,7 @@
 """LLM integration for natural-language navigation commands.
 
 Sends the user's text command alongside the map's room layout to DeepSeek
-(via the OpenAI-compatible API) and returns a target location in map pixels.
+(via the OpenAI-compatible API) and returns a target location in meters.
 """
 
 from __future__ import annotations
@@ -17,17 +17,17 @@ _log = logging.getLogger("llm_nav")
 
 
 def _build_prompt(map_data: MapData, user_command: str) -> str:
-    """Build the system + user prompt for the LLM."""
+    """Build the system + user prompt for the LLM.
+
+    ``map_data`` geometry is in meters.
+    """
     room_info = []
     for room in map_data.rooms:
-        # Convert room centre from pixels to meters.
-        cx_m = room.center[0] * map_data.metadata.scale_m_per_px
-        cy_m = room.center[1] * map_data.metadata.scale_m_per_px
         room_info.append(
             {
                 "id": room.id,
                 "name": room.name,
-                "center_m": [round(cx_m, 3), round(cy_m, 3)],
+                "center_m": [round(room.center[0], 3), round(room.center[1], 3)],
             }
         )
 
@@ -58,7 +58,7 @@ def query_location(
     base_url: str = "https://api.deepseek.com",
     timeout: float = 10.0,
 ) -> Optional[Tuple[float, float]]:
-    """Send a navigation query to DeepSeek and return the target in map pixels.
+    """Send a navigation query to DeepSeek and return the target in meters.
 
     Returns ``None`` if the API call fails or the response cannot be parsed.
     """
@@ -104,11 +104,9 @@ def query_location(
         print(f"[llm_nav] Failed to parse response: {raw!r}  error: {e}")
         return None
 
-    # Convert meters → map pixels.
-    scale = map_data.metadata.scale_m_per_px
-    px_result = (x_m / scale, y_m / scale)
-    _log.info("Resolved to map pixels: (%.1f, %.1f)", px_result[0], px_result[1])
-    return px_result
+    result = (x_m, y_m)
+    _log.info("Resolved to map meters: (%.3f, %.3f)", result[0], result[1])
+    return result
 
 
 def query_location_async(
@@ -123,7 +121,7 @@ def query_location_async(
     """Run query_location in a background thread and call ``callback(result)``.
 
     The callback receives ``Optional[Tuple[float, float]]`` — the target in
-    map pixels, or ``None`` on failure.
+    meters, or ``None`` on failure.
     """
 
     def _worker():

@@ -1,7 +1,8 @@
 """Zenoh-based pose estimator.
 
-Subscribes to sensor/lidar and sensor/wheel_speed from the simulator,
-runs a particle filter, and publishes the estimated pose on estimate/pose.
+Subscribes to sensor/lidar from the simulator and sensor/wheel_speed from the
+drive node, runs a particle filter, and publishes the estimated pose on
+estimate/pose.
 
 Uses RingChannel(1) for the LIDAR subscriber so the particle filter
 always processes only the most recent scan — stale backlogs are dropped.
@@ -20,7 +21,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import zenoh
 import zenoh.handlers
@@ -36,6 +37,7 @@ if str(_ZENOH_DIR) not in sys.path:
 
 from map_format import MapData, Apriltag, new_empty_map
 from pose_estimation.particle_filter import ParticleFilter
+from simulation.kinematics import wheel_to_unicycle
 from simulation.raycast import RayHit
 
 # ---------------------------------------------------------------------------
@@ -44,12 +46,19 @@ from simulation.raycast import RayHit
 
 LIDAR_MAX_RANGE_M = 10.0
 
+# After an AprilTag anchor, keep random particle injection localized to the
+# current estimate (rather than global across the map) for this many seconds.
+ANCHOR_LOCAL_INJECT_S = 30.0
+
+# How much odometry history to keep (seconds), so a delayed AprilTag detection
+# can be projected forward to "now" from its capture time.
+ODOM_HISTORY_S = 2.0
+
 
 class PoseEstimator:
     def __init__(self, map_path: Path):
-        # Load the same map the simulator uses.
+        # Load the same map the simulator uses (geometry is in meters).
         self.map_data = self._load_map(map_path)
-        self.scale_m_per_px = self.map_data.metadata.scale_m_per_px
 
         # Particle filter (same parameters as the old simulator).
         self.pf = ParticleFilter(
@@ -64,10 +73,15 @@ class PoseEstimator:
         self.estimated_y: float = 0.0
         self.estimated_theta: float = 0.0
 
-        # Accumulated odometry deltas (px, rad) waiting to be consumed.
-        # Protected by _pf_lock.
-        self._pending_delta_forward: float = 0.0
-        self._pending_delta_theta: float = 0.0
+        # Timestamped odometry deltas (t_epoch, delta_forward, delta_theta)
+        # waiting to be consumed.  Protected by _pf_lock.
+        self._odom_buffer: List[Tuple[float, float, float]] = []
+
+        # Short rolling history of odometry deltas, kept separately from
+        # _odom_buffer (which LIDAR drains) so a delayed AprilTag anchor can sum
+        # "odometry since capture" and project itself forward to now.  Protected
+        # by _pf_lock.
+        self._odom_history: List[Tuple[float, float, float]] = []
 
         # Wheel speed tracking for delta integration.
         self._last_wheel_time: Optional[float] = None
@@ -113,7 +127,7 @@ class PoseEstimator:
         # Protected by _tag_det_lock.
         # -------------------------------------------------------------------
         self._tag_det_lock = threading.Lock()
-        self._latest_tag_dets: Optional[List[dict]] = None
+        self._latest_tag_dets: Optional[Tuple[Optional[float], List[dict]]] = None
         self._last_anchor_time: float = 0.0  # rate-limit anchoring to 2 Hz
 
         # Subscribe with a callback that just stores the latest detection.
@@ -137,39 +151,49 @@ class PoseEstimator:
     # -------------------------------------------------------------------
 
     def _on_wheel_speed(self, sample):
-        """Accumulate odometry deltas from wheel speed messages.
+        """Accumulate timestamped odometry deltas from wheel speed messages.
 
-        Runs on a Zenoh I/O thread.  Only touches the pending-delta fields
-        (lock-protected) and _last_wheel_time; never touches the particle
+        Runs on a Zenoh I/O thread.  Appends (t, delta_forward, delta_theta)
+        to the odometry buffer (lock-protected) using the message's source
+        timestamp, so the filter can integrate odometry up to each LIDAR scan's
+        capture time rather than by arrival time.  Never touches the particle
         filter directly.
         """
-        now = time.time()
-
         try:
             payload = sample.payload.to_string()
             wheel_data = json.loads(payload)
+            left_rps = float(wheel_data["left_rps"])
+            right_rps = float(wheel_data["right_rps"])
+            t = float(wheel_data.get("t", time.time()))
+            linear_mps, angular_rps = wheel_to_unicycle(left_rps, right_rps)
         except (json.JSONDecodeError, Exception) as exc:
             print(f"[pose_estimator] Failed to parse wheel speed message: {exc}")
             return
 
-        linear_mps = wheel_data["linear_mps"]
-        angular_rps = wheel_data["angular_rps"]
-
         if self._last_wheel_time is not None:
-            dt = now - self._last_wheel_time
+            dt = t - self._last_wheel_time
             if 0.0 < dt < 1.0:
-                delta_forward = (linear_mps / self.scale_m_per_px) * dt
+                delta_forward = linear_mps * dt
                 delta_theta = angular_rps * dt
                 with self._pf_lock:
-                    self._pending_delta_forward += delta_forward
-                    self._pending_delta_theta += delta_theta
+                    self._odom_buffer.append((t, delta_forward, delta_theta))
+                    self._odom_history.append((t, delta_forward, delta_theta))
+                    # Bound both buffers: drop entries older than the retention
+                    # window.  _odom_buffer is normally drained by LIDAR, but if
+                    # LIDAR stalls (or clocks skew) it would otherwise grow
+                    # without bound.
+                    cutoff = t - ODOM_HISTORY_S
+                    while self._odom_history and self._odom_history[0][0] < cutoff:
+                        self._odom_history.pop(0)
+                    while self._odom_buffer and self._odom_buffer[0][0] < cutoff:
+                        self._odom_buffer.pop(0)
         else:
             # First wheel speed message: initialize the particle filter
             # near the origin (room 0 center).  Better start than uniform
             # across the whole map.
             self._initialize_near_origin()
 
-        self._last_wheel_time = now
+        self._last_wheel_time = t
 
     # -------------------------------------------------------------------
     # AprilTag callback (fast, just stores latest detection for main loop)
@@ -183,11 +207,13 @@ class PoseEstimator:
         its own lock.
         """
         try:
-            dets = json.loads(sample.payload.to_string())
+            data = json.loads(sample.payload.to_string())
+            dets = data.get("detections", [])
+            tag_t = data.get("t")
         except (json.JSONDecodeError, Exception):
             return
         with self._tag_det_lock:
-            self._latest_tag_dets = dets
+            self._latest_tag_dets = (tag_t, dets)
 
     def _process_apriltags(self):
         """Consume the latest AprilTag detection (if any) and anchor the
@@ -196,11 +222,13 @@ class PoseEstimator:
         Called from the main loop after each LIDAR filter step.
         """
         with self._tag_det_lock:
-            dets = self._latest_tag_dets
+            latest = self._latest_tag_dets
             self._latest_tag_dets = None
 
-        if not dets or not self._initialized:
+        if not latest or not self._initialized:
             return
+
+        tag_t, dets = latest
 
         for det in dets:
             tag_id = det["id"]
@@ -219,24 +247,27 @@ class PoseEstimator:
             #   robot_world_xy = tag_world_xy - R(robot_theta) * (x_rel, y_rel)
             #   robot_world_θ  = tag_world_yaw - yaw_rel
             #
-            x_rel_px = det["x_rel"] / self.scale_m_per_px
-            y_rel_px = det["y_rel"] / self.scale_m_per_px
+            x_rel_m = det["x_rel"]
+            y_rel_m = det["y_rel"]
             yaw_rel = det["yaw_rel"]
 
-            cos_est = math.cos(self.estimated_theta)
-            sin_est = math.sin(self.estimated_theta)
+            # The tag detection is an *absolute* measurement: derive the robot's
+            # world pose directly from the tag's known world pose and the
+            # relative transform, without relying on the (possibly wrong)
+            # current estimate.
+            anchor_theta = tag.yaw_rad - yaw_rel
+            cos_a = math.cos(anchor_theta)
+            sin_a = math.sin(anchor_theta)
 
-            # Rotate the relative vector from robot frame to world frame.
-            world_dx = x_rel_px * cos_est - y_rel_px * sin_est
-            world_dy = x_rel_px * sin_est + y_rel_px * cos_est
+            world_dx = x_rel_m * cos_a - y_rel_m * sin_a
+            world_dy = x_rel_m * sin_a + y_rel_m * cos_a
 
             anchor_x = tag.x - world_dx
             anchor_y = tag.y - world_dy
-            anchor_theta = tag.yaw_rad - yaw_rel
 
-            # Anchor: inject only a fraction of particles around the
-            # anchor pose so the LIDAR filter keeps its diversity.
-            # Rate-limit to 2 Hz to avoid destabilizing the filter.
+            # Jump the filter to the absolute pose (reset all particles).
+            # Rate-limit to 2 Hz so we don't re-snap every scan while the tag
+            # stays in view.
             now = time.time()
             if now - self._last_anchor_time >= 0.5:
                 with self._pf_lock:
@@ -244,15 +275,32 @@ class PoseEstimator:
                         anchor_x,
                         anchor_y,
                         anchor_theta,
-                        std_xy_px=5.0,
+                        std_xy_m=0.25,
                         std_theta_rad=0.05,
-                        fraction=0.3,
+                        fraction=1.0,
                     )
+
+                    # The detection is delayed: its pose is valid at the capture
+                    # time, not now.  Project the freshly-anchored particles
+                    # forward using the odometry collected since capture, so the
+                    # estimate lands at "now" instead of "now - delay".
+                    if tag_t is not None:
+                        fwd = 0.0
+                        th = 0.0
+                        for t, df, dth in self._odom_history:
+                            if t > tag_t:
+                                fwd += df
+                                th += dth
+                        if fwd != 0.0 or th != 0.0:
+                            self.pf.predict(fwd, th)
+                        # Those deltas are now baked into the estimate; drop any
+                        # still-pending copies so LIDAR doesn't re-apply them.
+                        self._odom_buffer.clear()
                 self._last_anchor_time = now
 
             print(
                 f"[pose_estimator] AprilTag {tag_id} anchor: "
-                f"x={anchor_x:.1f}px, y={anchor_y:.1f}px, "
+                f"x={anchor_x:.2f}m, y={anchor_y:.2f}m, "
                 f"θ={math.degrees(anchor_theta):.1f}°"
             )
             # Only use the first tag for anchoring.
@@ -267,19 +315,18 @@ class PoseEstimator:
             cx = (min(xs) + max(xs)) / 2.0
             cy = (min(ys) + max(ys)) / 2.0
         else:
-            cx = self.map_data.metadata.size_px[0] / 2.0
-            cy = self.map_data.metadata.size_px[1] / 2.0
+            cx = self.map_data.metadata.size_m[0] / 2.0
+            cy = self.map_data.metadata.size_m[1] / 2.0
 
         with self._pf_lock:
-            self.pf.initialize_near(cx, cy, 0.0, std_xy_px=30.0, std_theta_rad=0.5)
+            self.pf.initialize_near(cx, cy, 0.0, std_xy_m=1.5, std_theta_rad=0.5)
             self.estimated_x, self.estimated_y, self.estimated_theta = (
                 self.pf.estimate()
             )
             self._initialized = True
-            self._pending_delta_forward = 0.0
-            self._pending_delta_theta = 0.0
+            self._odom_buffer.clear()
 
-        print(f"[pose_estimator] Initialized particles near " f"({cx:.1f}, {cy:.1f})")
+        print(f"[pose_estimator] Initialized particles near " f"({cx:.2f}, {cy:.2f}) m")
 
     # -------------------------------------------------------------------
     # LIDAR processing (heavy — called from main loop with RingChannel)
@@ -288,8 +335,9 @@ class PoseEstimator:
     def _process_lidar(self, sample):
         """Called from the main loop when a fresh LIDAR scan arrives.
 
-        This is the main filter step: consume all pending odometry deltas,
-        predict, then update with the LIDAR scan, estimate, resample.
+        This is the main filter step: consume the odometry deltas up to the
+        scan's capture time, predict, then update with the LIDAR scan,
+        estimate, resample.
         The entire sequence is protected by a lock so wheel-speed callbacks
         only accumulate deltas without touching the filter during update.
         """
@@ -304,38 +352,55 @@ class PoseEstimator:
             print(f"[pose_estimator] Failed to parse LIDAR message: {exc}")
             return
 
+        scan_t = lidar_data.get("t")
+        if scan_t is not None:
+            scan_t = float(scan_t)
+        rays = lidar_data.get("rays", [])
+
         # Convert {angle_rad, distance_m} back to RayHit objects.
         ray_hits: List[RayHit] = []
-        for entry in lidar_data:
+        for entry in rays:
             angle_rad = entry["angle_rad"]
             distance_m = entry["distance_m"]
-            distance_px = distance_m / self.scale_m_per_px
 
             # The particle filter only uses hit.angle (relative to forward)
             # and hit.distance.  The absolute hit point is not used by the
             # filter, so we reconstruct it from the current estimate.
-            hit_x = self.estimated_x + distance_px * math.cos(
+            hit_x = self.estimated_x + distance_m * math.cos(
                 self.estimated_theta + angle_rad
             )
-            hit_y = self.estimated_y + distance_px * math.sin(
+            hit_y = self.estimated_y + distance_m * math.sin(
                 self.estimated_theta + angle_rad
             )
 
             ray_hits.append(
                 RayHit(
                     angle=angle_rad,
-                    distance=distance_px,
+                    distance=distance_m,
                     point=(hit_x, hit_y),
                 )
             )
 
         # ---- Atomic predict → update → estimate → resample ----
         with self._pf_lock:
-            # Apply all accumulated odometry.
-            if self._pending_delta_forward != 0.0 or self._pending_delta_theta != 0.0:
-                self.pf.predict(self._pending_delta_forward, self._pending_delta_theta)
-                self._pending_delta_forward = 0.0
-                self._pending_delta_theta = 0.0
+            # Apply odometry deltas up to the scan's capture time (or all of
+            # them if the scan carries no timestamp), so the scan is fused
+            # against the pose at the moment it was taken, not when it arrived.
+            total_forward = 0.0
+            total_theta = 0.0
+            if scan_t is None:
+                while self._odom_buffer:
+                    _, df, dth = self._odom_buffer.pop(0)
+                    total_forward += df
+                    total_theta += dth
+            else:
+                while self._odom_buffer and self._odom_buffer[0][0] <= scan_t:
+                    _, df, dth = self._odom_buffer.pop(0)
+                    total_forward += df
+                    total_theta += dth
+
+            if total_forward != 0.0 or total_theta != 0.0:
+                self.pf.predict(total_forward, total_theta)
 
             # Weight particles by how well they explain the LIDAR scan.
             self.pf.update(ray_hits)
@@ -346,7 +411,15 @@ class PoseEstimator:
             )
 
             # Systematic resampling + random injection.
-            self.pf.resample()
+            # After a recent AprilTag anchor, inject the random fraction
+            # locally around the estimate; otherwise scatter it globally.
+            if time.time() - self._last_anchor_time < ANCHOR_LOCAL_INJECT_S:
+                self.pf.resample(
+                    inject_mode="local",
+                    anchor=(self.estimated_x, self.estimated_y),
+                )
+            else:
+                self.pf.resample()
 
         # Publish the estimated pose (outside the lock).
         self._publish_pose()
@@ -359,17 +432,16 @@ class PoseEstimator:
         """Publish the estimated pose as JSON on estimate/pose."""
         msg = json.dumps(
             {
-                "x_px": self.estimated_x,
-                "y_px": self.estimated_y,
+                "x_m": self.estimated_x,
+                "y_m": self.estimated_y,
                 "theta_rad": self.estimated_theta,
-                "x_m": self.estimated_x * self.scale_m_per_px,
-                "y_m": self.estimated_y * self.scale_m_per_px,
+                "t": time.time(),
             }
         )
         self._pub_pose.put(msg)
         print(
-            f"[pose_estimator] Pose: x={self.estimated_x:.1f}px, "
-            f"y={self.estimated_y:.1f}px, "
+            f"[pose_estimator] Pose: x={self.estimated_x:.2f}m, "
+            f"y={self.estimated_y:.2f}m, "
             f"θ={math.degrees(self.estimated_theta):.1f}°"
         )
 

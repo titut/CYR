@@ -8,8 +8,8 @@ and estimate their 6-DOF pose.  Here we receive pre-computed range/bearing
 measurements from the simulator and republish them as structured detections.
 
 Topics:
-    Subscribes:  sensor/camera/apriltag  — raw visible tags [{id, range_m, ...}]
-    Publishes:   detection/apriltag      — [{id, x_rel, y_rel, yaw_rel, size_m}]
+    Subscribes:  sensor/camera/apriltag  — {"t": float, "detections": [{id, range_m, ...}]}
+    Publishes:   detection/apriltag      — {"t": float, "detections": [{id, x_rel, y_rel, yaw_rel, size_m}]}
 
 Usage:
     python -m zenoh.apriltag_detection.detector [path/to/map.json]
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -37,6 +38,10 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
+
+
+# Simulated image-processing time per detection (seconds).
+DETECTION_PROCESSING_S = 0.08
 
 
 class ApriltagDetector:
@@ -71,7 +76,9 @@ class ApriltagDetector:
     def _process_camera_data(self, sample):
         """Convert polar measurements to Cartesian relative transforms."""
         try:
-            raw_tags = json.loads(sample.payload.to_string())
+            raw = json.loads(sample.payload.to_string())
+            raw_tags = raw.get("detections", [])
+            source_t = raw.get("t")
         except (json.JSONDecodeError, Exception) as exc:
             print(f"[apriltag_detector] Failed to parse camera data: {exc}")
             return
@@ -100,7 +107,15 @@ class ApriltagDetector:
             )
 
         if detections:
-            self._pub_detection.put(json.dumps(detections))
+            # Simulate image-processing latency.  The output keeps the camera's
+            # capture time ("t") so the downstream anchor is not shifted by the
+            # detection compute time.
+            time.sleep(DETECTION_PROCESSING_S)
+
+            msg = {"detections": detections}
+            if source_t is not None:
+                msg["t"] = source_t
+            self._pub_detection.put(json.dumps(msg))
 
     # -----------------------------------------------------------------------
     # Main loop

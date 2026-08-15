@@ -26,16 +26,17 @@ if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
 from simulation.occupancy_grid import OccupancyGrid
+from navigation.astar import plan_path as _astar_plan_path
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_EXPAND_DIS = 15.0  # px — how far each tree edge extends
-_DEFAULT_PATH_RESOLUTION = 2.5  # px — resolution for edge collision sampling
+_DEFAULT_EXPAND_DIS = 0.75  # m — how far each tree edge extends
+_DEFAULT_PATH_RESOLUTION = 0.125  # m — resolution for edge collision sampling
 _DEFAULT_GOAL_SAMPLE_RATE = 25  # % — chance to sample the goal directly
 _DEFAULT_MAX_ITER = 3000  # max RRT iterations
-_DEFAULT_CONNECT_CIRCLE_DIST = 45.0  # px — rewiring ball radius factor
+_DEFAULT_CONNECT_CIRCLE_DIST = 2.25  # m — rewiring ball radius factor
 
 
 def _segment_collision_free(
@@ -44,7 +45,7 @@ def _segment_collision_free(
     y1: float,
     x2: float,
     y2: float,
-    half_size_px: float,
+    half_size: float,
     step: float = _DEFAULT_PATH_RESOLUTION,
 ) -> bool:
     """True if the straight line (x1,y1)→(x2,y2) has no occupied cells."""
@@ -52,7 +53,7 @@ def _segment_collision_free(
     dy = y2 - y1
     dist = math.hypot(dx, dy)
     if dist == 0:
-        return _point_collision_free(grid, x1, y1, half_size_px)
+        return _point_collision_free(grid, x1, y1, half_size)
 
     steps = max(1, int(dist / step))
     for i in range(steps + 1):
@@ -61,7 +62,7 @@ def _segment_collision_free(
         y = y1 + dy * t
         gx, gy = grid.world_to_grid(x, y)
         # Check a small square around the point for the robot's size.
-        margin_cells = max(1, int(half_size_px / grid.resolution))
+        margin_cells = max(1, int(half_size / grid.resolution))
         for dx_c in range(-margin_cells, margin_cells + 1):
             for dy_c in range(-margin_cells, margin_cells + 1):
                 if grid.is_occupied(gx + dx_c, gy + dy_c):
@@ -73,11 +74,11 @@ def _point_collision_free(
     grid: OccupancyGrid,
     x: float,
     y: float,
-    half_size_px: float,
+    half_size: float,
 ) -> bool:
     """True if the robot footprint centered at (x, y) is collision-free."""
     gx, gy = grid.world_to_grid(x, y)
-    margin_cells = max(1, int(half_size_px / grid.resolution))
+    margin_cells = max(1, int(half_size / grid.resolution))
     for dx_c in range(-margin_cells, margin_cells + 1):
         for dy_c in range(-margin_cells, margin_cells + 1):
             if grid.is_occupied(gx + dx_c, gy + dy_c):
@@ -89,21 +90,21 @@ def _find_free_nearby(
     grid: OccupancyGrid,
     x: float,
     y: float,
-    half_size_px: float,
-    search_radius_px: float = 25.0,
+    half_size: float,
+    search_radius: float = 1.25,
     angle_steps: int = 16,
 ) -> Optional[Tuple[float, float]]:
     """Return a collision-free point near (x, y), or None if none exists.
 
     If (x, y) is already free, returns it. Otherwise searches the occupancy
-    grid cells within search_radius_px of the requested point and returns the
-    closest cell centre whose robot footprint is collision-free.
+    grid cells within search_radius (meters) of the requested point and returns
+    the closest cell centre whose robot footprint is collision-free.
     """
-    if _point_collision_free(grid, x, y, half_size_px):
+    if _point_collision_free(grid, x, y, half_size):
         return (x, y)
 
     center_gx, center_gy = grid.world_to_grid(x, y)
-    radius_cells = int(math.ceil(search_radius_px / grid.resolution))
+    radius_cells = int(math.ceil(search_radius / grid.resolution))
 
     best_dist = float("inf")
     best_point: Optional[Tuple[float, float]] = None
@@ -116,7 +117,7 @@ def _find_free_nearby(
                 continue
 
             wx, wy = grid.grid_to_world(gx, gy)
-            if _point_collision_free(grid, wx, wy, half_size_px):
+            if _point_collision_free(grid, wx, wy, half_size):
                 dist = math.hypot(wx - x, wy - y)
                 if dist < best_dist:
                     best_dist = dist
@@ -140,7 +141,7 @@ class _Node:
 class RRTStar:
     """RRT* path planner.
 
-    Parameters correspond to the sample code, adapted to map-pixel units.
+    Parameters correspond to the sample code, adapted to meter units.
     """
 
     def __init__(
@@ -148,7 +149,7 @@ class RRTStar:
         start: Tuple[float, float],
         goal: Tuple[float, float],
         grid: OccupancyGrid,
-        half_size_px: float,
+        half_size: float,
         rand_area: Tuple[float, float, float, float],  # min_x, min_y, max_x, max_y
         expand_dis: float = _DEFAULT_EXPAND_DIS,
         path_resolution: float = _DEFAULT_PATH_RESOLUTION,
@@ -159,7 +160,7 @@ class RRTStar:
         self.start = _Node(start[0], start[1])
         self.goal = _Node(goal[0], goal[1])
         self.grid = grid
-        self.half_size_px = half_size_px
+        self.half_size = half_size
         self.min_rand, self.max_rand = rand_area[0], rand_area[2]  # x-range
         self.min_y, self.max_y = rand_area[1], rand_area[3]  # y-range
         self.expand_dis = expand_dis
@@ -258,7 +259,7 @@ class RRTStar:
             node.parent.y,
             node.x,
             node.y,
-            self.half_size_px,
+            self.half_size,
             step=self.path_resolution,
         )
 
@@ -326,7 +327,7 @@ class RRTStar:
                 new_node.y,
                 near_node.x,
                 near_node.y,
-                self.half_size_px,
+                self.half_size,
                 step=self.path_resolution,
             ):
                 continue
@@ -362,7 +363,7 @@ class RRTStar:
                 node.y,
                 self.goal.x,
                 self.goal.y,
-                self.half_size_px,
+                self.half_size,
                 step=self.path_resolution,
             ):
                 continue
@@ -373,7 +374,9 @@ class RRTStar:
 
         return best_idx
 
-    def _generate_final_course(self, goal_ind: int) -> Optional[List[Tuple[float, float]]]:
+    def _generate_final_course(
+        self, goal_ind: int
+    ) -> Optional[List[Tuple[float, float]]]:
         """Backtrack from goal-connected node to start, producing waypoints.
 
         Returns None if any backtracked edge is no longer collision-free.
@@ -387,7 +390,7 @@ class RRTStar:
                 node.parent.y,
                 node.x,
                 node.y,
-                self.half_size_px,
+                self.half_size,
                 step=self.path_resolution,
             ):
                 return None
@@ -415,8 +418,8 @@ def plan_path(
 
     Args:
         grid: Occupancy grid for collision checking.
-        start_world: Start position in world coordinates (px).
-        goal_world: Goal position in world coordinates (px).
+        start_world: Start position in world coordinates (meters).
+        goal_world: Goal position in world coordinates (meters).
         footprint: List of (dx, dy) grid-cell offsets (not used directly;
                    half-size is derived from it for collision).
         max_iter: Maximum RRT iterations per attempt.
@@ -432,14 +435,14 @@ def plan_path(
     # clearance the planner should respect.
     if footprint:
         max_offset = max(max(abs(dx), abs(dy)) for dx, dy in footprint)
-        half_size_px = max_offset * grid.resolution
+        half_size = max_offset * grid.resolution
     else:
-        half_size_px = 0.0
+        half_size = 0.0
 
     # If the start or goal is slightly inside an inflated obstacle (common with
     # pose estimation error), nudge it to the nearest free point instead of
     # immediately failing.
-    free_start = _find_free_nearby(grid, start_world[0], start_world[1], half_size_px)
+    free_start = _find_free_nearby(grid, start_world[0], start_world[1], half_size)
     if free_start is None:
         logging.warning(
             "[rrt] Start %.1f,%.1f is in collision and no free point nearby.",
@@ -447,7 +450,7 @@ def plan_path(
             start_world[1],
         )
         return []
-    free_goal = _find_free_nearby(grid, goal_world[0], goal_world[1], half_size_px)
+    free_goal = _find_free_nearby(grid, goal_world[0], goal_world[1], half_size)
     if free_goal is None:
         logging.warning(
             "[rrt] Goal %.1f,%.1f is in collision and no free point nearby.",
@@ -471,7 +474,7 @@ def plan_path(
             start=free_start,
             goal=free_goal,
             grid=grid,
-            half_size_px=half_size_px,
+            half_size=half_size,
             rand_area=(min_x, min_y, max_x, max_y),
             max_iter=max_iter,
         )
@@ -479,12 +482,23 @@ def plan_path(
         if path is not None:
             return path
 
+    # RRT* is sampling-based and can miss narrow passages.  Fall back to A*,
+    # which is complete on the grid: if any path exists at this resolution,
+    # A* will find it.  Use the already-nudged start/goal so pose-estimation
+    # error does not make A* reject the endpoints.
     logging.warning(
-        "[rrt] No path found after %d attempts from %.1f,%.1f to %.1f,%.1f",
+        "[rrt] RRT* failed after %d attempts; falling back to A*.",
         retry_attempts,
-        free_start[0],
-        free_start[1],
-        free_goal[0],
-        free_goal[1],
     )
-    return []
+    fallback = _astar_plan_path(grid, free_start, free_goal, footprint)
+    if fallback:
+        logging.info("[rrt] A* fallback found a path with %d waypoints.", len(fallback))
+    else:
+        logging.warning(
+            "[rrt] A* fallback also failed from %.1f,%.1f to %.1f,%.1f",
+            free_start[0],
+            free_start[1],
+            free_goal[0],
+            free_goal[1],
+        )
+    return fallback

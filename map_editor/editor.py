@@ -165,8 +165,10 @@ class MapEditor:
             command=self._clear_map,
         ).pack(side=tk.BOTTOM, pady=20, padx=10)
 
-        # Canvas
-        width, height = self.map_data.metadata.size_px
+        # Canvas (meters → pixels for display).
+        size_m = self.map_data.metadata.size_m
+        width = int(round(size_m[0] * self._px_per_m))
+        height = int(round(size_m[1] * self._px_per_m))
         self.canvas = tk.Canvas(
             self.canvas_frame,
             width=width + 2 * CANVAS_MARGIN,
@@ -232,52 +234,65 @@ class MapEditor:
     # ------------------------------------------------------------------
 
     @property
+    def _px_per_m(self) -> float:
+        return 1.0 / self.map_data.metadata.scale_m_per_px
+
+    @property
+    def _grid_spacing_m(self) -> float:
+        return GRID_SPACING * self.map_data.metadata.scale_m_per_px
+
+    @property
+    def _snap_radius_m(self) -> float:
+        return SNAP_RADIUS * self.map_data.metadata.scale_m_per_px
+
+    @property
     def _origin_x(self) -> float:
-        return float(self.map_data.metadata.origin_px[0])
+        return float(self.map_data.metadata.origin_m[0])
 
     @property
     def _origin_y(self) -> float:
-        return float(self.map_data.metadata.origin_px[1])
+        return float(self.map_data.metadata.origin_m[1])
 
     def _to_map(self, cx: float, cy: float) -> Tuple[float, float]:
-        """Convert canvas coordinates to map coordinates (relative to origin)."""
+        """Convert canvas coordinates (px) to map coordinates (meters, relative to origin)."""
         return (
-            cx - CANVAS_MARGIN - self._origin_x,
-            cy - CANVAS_MARGIN - self._origin_y,
+            (cx - CANVAS_MARGIN) / self._px_per_m - self._origin_x,
+            (cy - CANVAS_MARGIN) / self._px_per_m - self._origin_y,
         )
 
     def _to_canvas(self, mx: float, my: float) -> Tuple[float, float]:
-        """Convert map coordinates (relative to origin) to canvas coordinates."""
+        """Convert map coordinates (meters, relative to origin) to canvas coordinates (px)."""
         return (
-            mx + self._origin_x + CANVAS_MARGIN,
-            my + self._origin_y + CANVAS_MARGIN,
+            (mx + self._origin_x) * self._px_per_m + CANVAS_MARGIN,
+            (my + self._origin_y) * self._px_per_m + CANVAS_MARGIN,
         )
 
     def _snap(self, mx: float, my: float) -> Tuple[float, float]:
-        """Snap a map coordinate to the nearest grid intersection."""
+        """Snap a map coordinate (meters) to the nearest grid intersection."""
+        spacing = self._grid_spacing_m
         return (
-            round(mx / GRID_SPACING) * GRID_SPACING,
-            round(my / GRID_SPACING) * GRID_SPACING,
+            round(mx / spacing) * spacing,
+            round(my / spacing) * spacing,
         )
 
     def _distance(self, a: Tuple[float, float], b: Tuple[float, float]) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
     @staticmethod
-    def _point_to_segment_distance(px: float, py: float, wall: Wall) -> float:
-        """Distance from point (px, py) to the wall segment."""
+    def _point_to_segment_distance(x: float, y: float, wall: Wall) -> float:
+        """Distance from point (x, y) to the wall segment."""
         wx = wall.x2 - wall.x1
         wy = wall.y2 - wall.y1
         length_sq = wx * wx + wy * wy
         if length_sq == 0:
-            return math.hypot(px - wall.x1, py - wall.y1)
+            return math.hypot(x - wall.x1, y - wall.y1)
         t = max(
             0.0,
-            min(1.0, ((px - wall.x1) * wx + (py - wall.y1) * wy) / length_sq),
+            min(1.0, ((x - wall.x1) * wx + (y - wall.y1) * wy) / length_sq),
         )
         proj_x = wall.x1 + t * wx
         proj_y = wall.y1 + t * wy
-        return math.hypot(px - proj_x, py - proj_y)
+        return math.hypot(x - proj_x, y - proj_y)
 
     # ------------------------------------------------------------------
     # Tool switching
@@ -324,8 +339,8 @@ class MapEditor:
         scale = self.map_data.metadata.scale_m_per_px
         lines.append(f"Scale: {scale:.4f} m/px")
         lines.append("")
-        origin = self.map_data.metadata.origin_px
-        lines.append(f"Origin: ({int(origin[0])}, {int(origin[1])})")
+        origin = self.map_data.metadata.origin_m
+        lines.append(f"Origin: ({origin[0]:.2f}, {origin[1]:.2f}) m")
 
         self.sidebar_info.config(text="\n".join(lines))
 
@@ -350,7 +365,7 @@ class MapEditor:
             # Close polygon if clicking near the first point
             if len(self.state.room_points) >= 3:
                 first = self.state.room_points[0]
-                if self._distance((mx, my), first) < SNAP_RADIUS:
+                if self._distance((mx, my), first) < self._snap_radius_m:
                     self._close_room_polygon()
                     return
             self.state.room_points.append((mx, my))
@@ -477,7 +492,7 @@ class MapEditor:
         """Return the index of the wall closest to (mx, my), or None if
         no wall is within SNAP_RADIUS."""
         best_idx = None
-        best_dist = SNAP_RADIUS
+        best_dist = self._snap_radius_m
         for i, wall in enumerate(self.map_data.walls):
             d = self._point_to_segment_distance(mx, my, wall)
             if d < best_dist:
@@ -488,7 +503,7 @@ class MapEditor:
     def _find_nearest_apriltag(self, mx: float, my: float) -> Optional[int]:
         """Return the index of the tag closest to (mx, my), or None."""
         best_idx = None
-        best_dist = SNAP_RADIUS * 1.5
+        best_dist = self._snap_radius_m * 1.5
         for i, tag in enumerate(self.map_data.apriltags):
             d = math.hypot(mx - tag.x, my - tag.y)
             if d < best_dist:
@@ -502,7 +517,7 @@ class MapEditor:
         best_dist = float("inf")
         for i, obstacle in enumerate(self.map_data.obstacles):
             d = math.hypot(mx - obstacle.x, my - obstacle.y)
-            if d <= obstacle.radius_px + SNAP_RADIUS and d < best_dist:
+            if d <= obstacle.radius_m + self._snap_radius_m and d < best_dist:
                 best_dist = d
                 best_idx = i
         return best_idx
@@ -520,9 +535,9 @@ class MapEditor:
     def _set_origin(self, new_ox: float, new_oy: float):
         """Set the map origin to (new_ox, new_oy) and rebase all geometry.
 
-        (new_ox, new_oy) are in the current map coordinate frame.
+        (new_ox, new_oy) are in the current map coordinate frame (meters).
         After this call, all coordinates are shifted so the origin is at (0, 0)
-        in the stored frame; origin_px records where the origin was placed.
+        in the stored frame; origin_m records where the origin was placed.
         """
         old_ox = self._origin_x
         old_oy = self._origin_y
@@ -532,7 +547,7 @@ class MapEditor:
         #   abs_x = new_ox + old_ox
         #   abs_y = new_oy + old_oy
         #
-        # We want origin_px = (abs_x, abs_y) and all geometry to be relative
+        # We want origin_m = (abs_x, abs_y) and all geometry to be relative
         # to that point.  So we shift every coordinate by subtracting (abs_x, abs_y).
         abs_x = new_ox + old_ox
         abs_y = new_oy + old_oy
@@ -561,19 +576,19 @@ class MapEditor:
             room.center = (cx - abs_x, cy - abs_y)
 
         # Update metadata.
-        self.map_data.metadata.origin_px = (int(abs_x), int(abs_y))
+        self.map_data.metadata.origin_m = (abs_x, abs_y)
 
         self._render_map()
         self._update_sidebar()
         self.status.config(
-            text=f"Origin set to ({int(abs_x)}, {int(abs_y)}) — geometry rebased."
+            text=f"Origin set to ({abs_x:.2f}, {abs_y:.2f}) m — geometry rebased."
         )
 
     def _reset_origin(self):
         """Reset the origin back to (0, 0), shifting all geometry back.
 
-        This is the inverse of _set_origin: we add origin_px back to every
-        coordinate and set origin_px to (0, 0).
+        This is the inverse of _set_origin: we add origin_m back to every
+        coordinate and set origin_m to (0, 0).
         """
         old_ox = self._origin_x
         old_oy = self._origin_y
@@ -604,7 +619,7 @@ class MapEditor:
             cx, cy = room.center
             room.center = (cx + old_ox, cy + old_oy)
 
-        self.map_data.metadata.origin_px = (0, 0)
+        self.map_data.metadata.origin_m = (0.0, 0.0)
 
         self._render_map()
         self._update_sidebar()
@@ -615,7 +630,7 @@ class MapEditor:
     # ------------------------------------------------------------------
 
     def _add_wall(self, x1: float, y1: float, x2: float, y2: float):
-        if self._distance((x1, y1), (x2, y2)) < 1:
+        if self._distance((x1, y1), (x2, y2)) < 0.01:
             return
         self.map_data.walls.append(Wall(x1=x1, y1=y1, x2=x2, y2=y2))
         self._render_map()
@@ -650,7 +665,9 @@ class MapEditor:
 
     def _finish_scale(self):
         p1, p2 = self.state.scale_points
-        pixel_distance = self._distance(p1, p2)
+        c1 = self._to_canvas(*p1)
+        c2 = self._to_canvas(*p2)
+        pixel_distance = math.hypot(c1[0] - c2[0], c1[1] - c2[1])
         if pixel_distance <= 0:
             messagebox.showerror("Scale Error", "Scale reference line has zero length.")
             self.state.scale_points = []
@@ -702,7 +719,7 @@ class MapEditor:
             obstacle_id += 1
 
         self.map_data.obstacles.append(
-            Obstacle(id=obstacle_id, x=mx, y=my, radius_px=GRID_SPACING)
+            Obstacle(id=obstacle_id, x=mx, y=my, radius_m=self._grid_spacing_m)
         )
         self._render_map()
         self._update_sidebar()
@@ -747,7 +764,7 @@ class MapEditor:
         # AprilTags
         for tag in self.map_data.apriltags:
             cx, cy = self._to_canvas(tag.x, tag.y)
-            half = max(4.0, (tag.size_m / self.map_data.metadata.scale_m_per_px) / 2.0)
+            half = max(4.0, (tag.size_m * self._px_per_m) / 2.0)
             rect_id = self.canvas.create_rectangle(
                 cx - half,
                 cy - half,
@@ -777,11 +794,12 @@ class MapEditor:
         # Obstacles
         for obstacle in self.map_data.obstacles:
             cx, cy = self._to_canvas(obstacle.x, obstacle.y)
+            radius = obstacle.radius_m * self._px_per_m
             self.canvas.create_oval(
-                cx - obstacle.radius_px,
-                cy - obstacle.radius_px,
-                cx + obstacle.radius_px,
-                cy + obstacle.radius_px,
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
                 fill=OBSTACLE_COLOR,
                 outline=OBSTACLE_OUTLINE,
                 width=2,
@@ -822,8 +840,7 @@ class MapEditor:
             )
 
         # Origin marker — draw at (0, 0) relative to origin, which is at
-        # the origin_px absolute position.  Since _to_canvas adds origin_px,
-        # canvas coords of the origin are simply (origin_px + MARGIN).
+        # the origin_m absolute position (converted to canvas px by _to_canvas).
         self._draw_origin_marker()
 
         # Room preview
@@ -904,7 +921,7 @@ class MapEditor:
                 )
 
     def _draw_grid(self):
-        width, height = self.map_data.metadata.size_px
+        width, height = self.map_data.metadata.size_m
         x0, y0 = self._to_canvas(0, 0)
         x1, y1 = self._to_canvas(width, height)
 
@@ -913,11 +930,16 @@ class MapEditor:
 
         # Grid lines — draw in the relative frame so they stay aligned with
         # snapped coordinates.
-        for x in range(0, width + 1, GRID_SPACING):
+        spacing = self._grid_spacing_m
+        nx = int(round(width / spacing))
+        for i in range(nx + 1):
+            x = i * spacing
             cx1, _ = self._to_canvas(x, 0)
             cx2, _ = self._to_canvas(x, height)
             self.canvas.create_line(cx1, y0, cx2, y1, fill="#eeeeee")
-        for y in range(0, height + 1, GRID_SPACING):
+        ny = int(round(height / spacing))
+        for j in range(ny + 1):
+            y = j * spacing
             _, cy1 = self._to_canvas(0, y)
             _, cy2 = self._to_canvas(width, y)
             self.canvas.create_line(x0, cy1, x1, cy2, fill="#eeeeee")

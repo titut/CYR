@@ -1,12 +1,12 @@
 """Zenoh-based navigation node.
 
 Subscribes to:
-    estimate/pose  — estimated pose from pose_estimator
-    nav/goal       — user-clicked target in map pixels
+    estimate/pose  — estimated pose from pose_estimator (meters)
+    nav/goal       — user-clicked target in meters
     nav/command    — natural-language navigation command
 
 Publishes:
-    nav/path       — planned waypoints as JSON list of [x, y] pairs
+    nav/path       — planned waypoints as JSON list of [x, y] pairs (meters)
 
 Usage:
     python zenoh/navigation/navigator.py [path/to/map.json]
@@ -41,7 +41,7 @@ if str(_ZENOH_DIR) not in sys.path:
 from map_format import MapData, new_empty_map
 from simulation.occupancy_grid import OccupancyGrid
 from simulation.raycast import cast_ray
-from navigation.rrt import plan_path
+from navigation.astar import plan_path
 from navigation.footprint import make_footprint
 from navigation.llm_nav import query_location_async
 
@@ -55,22 +55,14 @@ _REPLAN_THRESHOLD_M = 1.0  # Replan if bot strays >1 m from path.
 # Obstacle detection via LIDAR residual (actual vs. expected wall-only scan).
 LIDAR_MAX_RANGE_M = 10.0  # Must match simulator.
 _OBSTACLE_DETECTION_THRESHOLD_M = 0.3  # residual larger than this = obstacle
-_OBSTACLE_CLUSTER_RADIUS_M = 0.5  # points within this cluster together
-# Detected hit points sit on the obstacle's *near* surface, so we mark a circle
-# big enough to cover the obstacle body plus the robot's radius plus a margin.
-_OBSTACLE_MARK_MARGIN_PX = 3  # extra clearance beyond bot radius
+# Pose-estimation error makes the residual non-zero even where there is no
+# obstacle, producing transient "ghost" hit points.  A cell is only marked
+# occupied after being hit this many times within the age window, so single-
+# scan ghosts are filtered out while real (persistent) obstacles are kept.
+_OBSTACLE_CONFIRM_HITS = 2
+_OBSTACLE_HIT_MAX_AGE_S = 1.0
 _CHECK_INTERVAL_S = 0.25  # how often to scan and (maybe) replan
-
-# Dynamic obstacle confirmation / decay.
-# A point is only marked on the grid after it has been observed this many
-# times; this filters out single-scan pose-error ghosts.
-_OBSTACLE_CONFIRM_SCANS = 3
-# Confirmed obstacles are forgotten if not re-observed for this long.
-_OBSTACLE_DECAY_AGE_S = 5.0
-# Candidate obstacles (not yet confirmed) decay faster.
-_OBSTACLE_CANDIDATE_DECAY_AGE_S = 1.5
-# Candidates within this distance of an existing track are merged.
-_OBSTACLE_MERGE_RADIUS_M = 0.5
+_REPLAN_BACKOFF_S = 5.0  # wait before retrying after a failed replan
 
 
 class Navigator:
@@ -82,16 +74,15 @@ class Navigator:
         )
 
         self.map_data = self._load_map(map_path)
-        self.scale_m_per_px = self.map_data.metadata.scale_m_per_px
-        self.bot_radius_px = (BOT_SIZE_M / 2.0) / self.scale_m_per_px
+        self.bot_radius = BOT_SIZE_M / 2.0
 
-        # Occupancy grid + footprint for A*.
-        self._grid_resolution_px = max(1.0, 0.25 / self.scale_m_per_px)
+        # Occupancy grid + footprint for planning.
+        self._grid_resolution = 0.25  # meters per grid cell
         self.occ_grid = OccupancyGrid.from_walls(
-            self.map_data.walls, self._grid_resolution_px
+            self.map_data.walls, self._grid_resolution
         )
         self._bot_footprint = make_footprint(
-            self.bot_radius_px, self._grid_resolution_px
+            self.bot_radius, self._grid_resolution
         )
 
         # Latest estimate from pose_estimator.
@@ -101,22 +92,24 @@ class Navigator:
 
         # LIDAR scan state for obstacle detection.
         self._lidar_lock = threading.Lock()
-        self._latest_lidar: Optional[List[dict]] = None
+        self._latest_lidar: Optional[dict] = None
 
-        # Tracked dynamic obstacles. Each entry maps an arbitrary id to a dict:
-        #   center: (float, float)  - estimated world position
-        #   confidence: int           - consecutive observation count
-        #   last_seen: float            - time of last observation
-        # An obstacle is only marked on the grid once confidence reaches
-        # _OBSTACLE_CONFIRM_SCANS.
-        self._dynamic_obstacles: dict = {}
-        self._confirmed_obstacle_keys: set = set()
+        # Per-cell obstacle hit counts: (gx, gy) -> (count, last_seen).  A cell
+        # is only marked occupied after being hit _OBSTACLE_CONFIRM_HITS times,
+        # which filters out single-scan pose-error ghosts.
+        self._obstacle_hits: dict = {}
 
-        # Current path waypoints (world px), for blocking checks.
+        # Current path waypoints (world meters), for blocking checks.
         self._current_path: List[Tuple[float, float]] = []
 
         # Current navigation target.
         self._nav_target: Optional[Tuple[float, float]] = None
+
+        # Replanning state. Remember a blockage we failed to route around so we
+        # don't retry the same unreachable plan every scan, and throttle
+        # replanning after failures with a short backoff.
+        self._failed_blocked_idx: Optional[int] = None
+        self._replan_backoff_until: float = 0.0
 
         # LLM API key.
         self._api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -164,8 +157,8 @@ class Navigator:
         """Update the latest estimated pose."""
         try:
             data = json.loads(sample.payload.to_string())
-            self._est_x = float(data["x_px"])
-            self._est_y = float(data["y_px"])
+            self._est_x = float(data["x_m"])
+            self._est_y = float(data["y_m"])
             self._est_theta = float(data["theta_rad"])
         except (json.JSONDecodeError, KeyError, Exception):
             pass
@@ -183,22 +176,21 @@ class Navigator:
         """A user clicked a point on the map. Plan a path to it."""
         try:
             data = json.loads(sample.payload.to_string())
-            target = (float(data["x_px"]), float(data["y_px"]))
+            target = (float(data["x_m"]), float(data["y_m"]))
         except (json.JSONDecodeError, KeyError, Exception) as exc:
             logging.warning("Failed to parse nav/goal: %s", exc)
             return
 
         self._nav_target = target
         self._current_path = []
+        self._failed_blocked_idx = None
+        self._replan_backoff_until = 0.0
+        self._obstacle_hits = {}
 
-        # New goal means a fresh world model: unknown dynamic obstacles from a
-        # previous navigation should not poison this plan.
-        self._reset_dynamic_obstacles_and_grid()
-
-        logging.info("Goal received: (%.1f, %.1f) px", target[0], target[1])
-        # Force-publish the new plan (even empty) because the old path, if any,
-        # leads to a different goal.
-        self._plan_and_publish(force=True)
+        logging.info("Goal received: (%.2f, %.2f) m", target[0], target[1])
+        # Plan immediately, but include any currently-visible obstacle particles
+        # so the initial path already routes around known obstacles.
+        self._plan_fresh(force=True)
 
     def _on_command(self, sample):
         """A user typed an LLM command. Resolve to coordinates, then plan."""
@@ -209,21 +201,22 @@ class Navigator:
 
         logging.info("LLM command: %r", text)
 
-        def _on_result(target_px: Optional[Tuple[float, float]]):
-            if target_px is not None:
-                self._nav_target = target_px
+        def _on_result(target_m: Optional[Tuple[float, float]]):
+            if target_m is not None:
+                self._nav_target = target_m
                 self._current_path = []
-
-                # See _on_goal: brand-new goal starts with a clean grid.
-                self._reset_dynamic_obstacles_and_grid()
+                self._failed_blocked_idx = None
+                self._replan_backoff_until = 0.0
+                self._obstacle_hits = {}
 
                 logging.info(
-                    "LLM resolved to: (%.1f, %.1f) px",
-                    target_px[0],
-                    target_px[1],
+                    "LLM resolved to: (%.2f, %.2f) m",
+                    target_m[0],
+                    target_m[1],
                 )
-                # Force-publish because the target changed.
-                self._plan_and_publish(force=True)
+                # Plan immediately, including currently-visible obstacle
+                # particles (see _on_goal).
+                self._plan_fresh(force=True)
             else:
                 logging.error("LLM query failed.")
 
@@ -278,16 +271,27 @@ class Navigator:
         logging.info("Published path with %d waypoints.", len(path))
         return True
 
+    def _plan_fresh(self, force: bool = False) -> bool:
+        """Detect current obstacle particles, rebuild the grid, then plan.
+
+        Used for brand-new goals so the initial path already routes around any
+        obstacle the LIDAR can currently see, rather than planning on a clean
+        walls-only grid and relying on a later reactive replan.
+        """
+        particles = self._detect_obstacle_particles()
+        self._populate_grid(particles)
+        return self._plan_and_publish(force=force)
+
     # -------------------------------------------------------------------
     # Obstacle detection + dynamic replanning
     # -------------------------------------------------------------------
 
-    def _detect_obstacles(self) -> List[Tuple[float, float]]:
+    def _detect_obstacle_particles(self) -> List[Tuple[float, float]]:
         """Compare actual LIDAR scan to the expected wall-only scan.
 
-        Any beam whose actual range is significantly shorter than the wall
-        it should be seeing indicates an obstacle blocking the view.  Hit
-        points are clustered into obstacle centers (world px).
+        Any beam whose actual range is significantly shorter than the wall it
+        should be seeing indicates an obstacle blocking the view.  The hit
+        points (obstacle particles) are returned as world-meter coordinates.
         """
         with self._lidar_lock:
             scan = self._latest_lidar
@@ -296,10 +300,10 @@ class Navigator:
         if not scan or self._nav_target is None:
             return []
 
-        max_range_px = LIDAR_MAX_RANGE_M / self.scale_m_per_px
-        blocked_hits: List[Tuple[float, float]] = []
+        max_range_m = LIDAR_MAX_RANGE_M
+        particles: List[Tuple[float, float]] = []
 
-        for entry in scan:
+        for entry in scan.get("rays", []):
             angle_rad = entry["angle_rad"]
             actual_m = entry["distance_m"]
 
@@ -308,60 +312,35 @@ class Navigator:
                 (self._est_x, self._est_y),
                 self._est_theta + angle_rad,
                 self.map_data.walls,
-                max_range_px,
+                max_range_m,
             )
-            expected_px = max_range_px if result is None else result[0]
-            expected_m = expected_px * self.scale_m_per_px
+            expected_m = max_range_m if result is None else result[0]
 
             if expected_m - actual_m > _OBSTACLE_DETECTION_THRESHOLD_M:
-                hit_dist_px = actual_m / self.scale_m_per_px
-                hit_x = self._est_x + hit_dist_px * math.cos(
+                hit_x = self._est_x + actual_m * math.cos(
                     self._est_theta + angle_rad
                 )
-                hit_y = self._est_y + hit_dist_px * math.sin(
+                hit_y = self._est_y + actual_m * math.sin(
                     self._est_theta + angle_rad
                 )
-                blocked_hits.append((hit_x, hit_y))
+                particles.append((hit_x, hit_y))
 
-        return self._cluster_obstacle_points(blocked_hits)
-
-    def _cluster_obstacle_points(
-        self, points: List[Tuple[float, float]]
-    ) -> List[Tuple[float, float]]:
-        """Greedy-cluster blocked hit points into obstacle centers."""
-        cluster_radius_px = _OBSTACLE_CLUSTER_RADIUS_M / self.scale_m_per_px
-        clusters: List[List] = []  # each is [cx, cy, count]
-
-        for px, py in points:
-            placed = False
-            for cluster in clusters:
-                cx, cy, count = cluster
-                if math.hypot(px - cx, py - cy) < cluster_radius_px:
-                    new_count = count + 1
-                    cluster[0] = cx + (px - cx) / new_count
-                    cluster[1] = cy + (py - cy) / new_count
-                    cluster[2] = new_count
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([px, py, 1])
-
-        return [(cx, cy) for cx, cy, _ in clusters]
+        return particles
 
     @staticmethod
     def _distance_point_to_segment(
-        px: float, py: float, x1: float, y1: float, x2: float, y2: float
+        x: float, y: float, x1: float, y1: float, x2: float, y2: float
     ) -> float:
-        """Distance from (px, py) to the line segment (x1,y1)-(x2,y2)."""
+        """Distance from (x, y) to the line segment (x1,y1)-(x2,y2)."""
         wx = x2 - x1
         wy = y2 - y1
         length_sq = wx * wx + wy * wy
         if length_sq == 0:
-            return math.hypot(px - x1, py - y1)
-        t = max(0.0, min(1.0, ((px - x1) * wx + (py - y1) * wy) / length_sq))
+            return math.hypot(x - x1, y - y1)
+        t = max(0.0, min(1.0, ((x - x1) * wx + (y - y1) * wy) / length_sq))
         proj_x = x1 + t * wx
         proj_y = y1 + t * wy
-        return math.hypot(px - proj_x, py - proj_y)
+        return math.hypot(x - proj_x, y - proj_y)
 
     def _current_path_index(self) -> int:
         """Return the index of the waypoint the robot is currently driving toward.
@@ -384,101 +363,77 @@ class Navigator:
             wx, wy = self._current_path[best_idx]
             nx, ny = self._current_path[best_idx + 1]
             dx_to_robot = self._est_x - wx
-            dy_to_robot = self._est_x - wy
+            dy_to_robot = self._est_y - wy
             dx_path = nx - wx
             dy_path = ny - wy
             if dx_to_robot * dx_path + dy_to_robot * dy_path > 0:
                 best_idx += 1
         return best_idx
 
-    def _obstacle_blocks_remaining_path(self, cx: float, cy: float) -> bool:
-        """True if the obstacle circle (with clearance) intersects the path.
-
-        Only the portion of the path still ahead of the robot is considered.
-        """
-        if len(self._current_path) < 2:
-            return False
-
-        start_idx = self._current_path_index()
-        clearance_px = self.bot_radius_px + _OBSTACLE_MARK_MARGIN_PX
-        for i in range(start_idx, len(self._current_path) - 1):
-            x1, y1 = self._current_path[i]
-            x2, y2 = self._current_path[i + 1]
-            if self._distance_point_to_segment(cx, cy, x1, y1, x2, y2) < clearance_px:
-                return True
-        return False
-
-    def _first_blocked_segment_index(self) -> Optional[int]:
+    def _first_blocked_segment_index(
+        self, obstacles: List[Tuple[float, float]]
+    ) -> Optional[int]:
         """Return the index of the first remaining path segment blocked by
-        any confirmed obstacle, or None if the remaining path is clear.
+        any obstacle particle, or None if the remaining path is clear.
         """
         if len(self._current_path) < 2:
             return None
 
         start_idx = self._current_path_index()
-        clearance_px = self.bot_radius_px + _OBSTACLE_MARK_MARGIN_PX
+        clearance = self.bot_radius
         for i in range(start_idx, len(self._current_path) - 1):
             x1, y1 = self._current_path[i]
             x2, y2 = self._current_path[i + 1]
-            for key in self._confirmed_obstacle_keys:
-                cx, cy = self._dynamic_obstacles[key]["center"]
+            for cx, cy in obstacles:
                 if (
                     self._distance_point_to_segment(cx, cy, x1, y1, x2, y2)
-                    < clearance_px
+                    < clearance
                 ):
                     return i
         return None
 
-    def _find_nearest_tracked_obstacle(
-        self, cx: float, cy: float, radius_px: float
-    ) -> Optional[str]:
-        """Return the id of a tracked obstacle within radius_px of (cx, cy)."""
-        best_key: Optional[str] = None
-        best_d2 = radius_px * radius_px
-        for key, obs in self._dynamic_obstacles.items():
-            ox, oy = obs["center"]
-            d2 = (ox - cx) ** 2 + (oy - cy) ** 2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_key = key
-        return best_key
+    def _populate_grid(self, particles: List[Tuple[float, float]]) -> None:
+        """Rebuild the occupancy grid from walls and mark confirmed obstacles.
 
-    def _rebuild_occupancy_grid(self) -> None:
-        """Rebuild the occupancy grid from walls plus confirmed obstacles."""
-        self.occ_grid = OccupancyGrid.from_walls(
-            self.map_data.walls, self._grid_resolution_px
-        )
-        clearance_px = self.bot_radius_px + _OBSTACLE_MARK_MARGIN_PX
-        for key in self._confirmed_obstacle_keys:
-            cx, cy = self._dynamic_obstacles[key]["center"]
-            self.occ_grid.mark_circle(cx, cy, clearance_px)
-
-    def _reset_dynamic_obstacles_and_grid(self) -> None:
-        """Clear all dynamic obstacle state and rebuild the occupancy grid
-        from walls only.
-
-        Called when a brand-new navigation goal is received so every new goal
-        starts from the same clean world model as the first navigation.
-        Dynamic obstacles will be re-detected and re-added if they block the
-        new path.
+        Each LIDAR hit point lands in a single grid cell.  A cell is only
+        marked occupied after being hit _OBSTACLE_CONFIRM_HITS times within a
+        short window, so transient pose-error ghosts (which move between scans)
+        are filtered out while real obstacles (hit consistently) are kept.  The
+        planner's robot footprint already supplies the clearance, so no extra
+        inflation is applied.
         """
-        self._dynamic_obstacles = {}
-        self._confirmed_obstacle_keys = set()
         self.occ_grid = OccupancyGrid.from_walls(
-            self.map_data.walls, self._grid_resolution_px
+            self.map_data.walls, self._grid_resolution
         )
+        now = time.time()
 
-    def _repair_path(self) -> bool:
+        # Forget hits that have not been re-observed recently.
+        for key in list(self._obstacle_hits.keys()):
+            if now - self._obstacle_hits[key][1] > _OBSTACLE_HIT_MAX_AGE_S:
+                del self._obstacle_hits[key]
+
+        # Record this scan's hits.
+        seen: set = set()
+        for cx, cy in particles:
+            gx, gy = self.occ_grid.world_to_grid(cx, cy)
+            if 0 <= gx < self.occ_grid.cols and 0 <= gy < self.occ_grid.rows:
+                seen.add((gx, gy))
+        for key in seen:
+            count, _ = self._obstacle_hits.get(key, (0, 0.0))
+            self._obstacle_hits[key] = (count + 1, now)
+
+        # Mark confirmed cells.
+        for (gx, gy), (count, _) in self._obstacle_hits.items():
+            if count >= _OBSTACLE_CONFIRM_HITS:
+                self.occ_grid.grid[gy, gx] = True
+
+    def _repair_path(self, blocked_idx: int) -> bool:
         """Repair the current path by keeping the portion from the robot's
         current position to just before the blocked segment, planning a new
         suffix from that safe point to the goal, and publishing the result.
 
         Returns True if a repaired (or fallback) path was published.
         """
-        blocked_idx = self._first_blocked_segment_index()
-        if blocked_idx is None:
-            return False
-
         # Stop the robot while a new path is being computed.
         self._pub_path.put(json.dumps([]))
         logging.info("Published empty path while replanning.")
@@ -514,11 +469,12 @@ class Navigator:
             )
             return self._plan_and_publish()
 
-        # Build the repaired path: current estimated pose, then the still-valid
-        # waypoints from the current path up to and including safe_point, then
-        # the new suffix (excluding its first point, which is safe_point).
-        current_pose = (self._est_x, self._est_y)
-        prefix = [current_pose] + list(self._current_path[start_idx : safe_idx + 1])
+        # Build the repaired path: the still-valid waypoints from the current
+        # path up to and including safe_point, then the new suffix (excluding
+        # its first point, which is safe_point).  We start from the first
+        # still-valid waypoint rather than the raw estimated pose, which can
+        # drift outside the map and would otherwise be published as a waypoint.
+        prefix = list(self._current_path[start_idx : safe_idx + 1])
         suffix_without_start = list(suffix[1:])
         repaired = prefix + suffix_without_start
 
@@ -534,103 +490,69 @@ class Navigator:
         return True
 
     def _check_and_replan(self):
-        """Detect obstacles, confirm them over time, decay stale ones, and replan.
+        """Detect obstacle particles, mark them on the grid, and replan if needed.
 
-        Obstacles are only marked on the grid after being observed multiple
-        times; this suppresses single-scan ghosts caused by pose errors.
-        Confirmed obstacles that are no longer observed decay and are removed,
-        so old false positives do not permanently block the map.
+        Each scan rebuilds the grid from the static walls plus the currently
+        visible obstacle particles, so a plan made here already accounts for
+        obstacles.  If a particle blocks the remaining path, the path is
+        repaired around it.  A failed repair is remembered so the same blockage
+        is not retried every scan; planning resumes only once the obstacle
+        situation changes.
         """
         if self._nav_target is None:
             return
 
+        now = time.time()
+
+        # Detect obstacle particles and rebuild the grid from walls + particles
+        # before any planning, so paths account for known obstacles up front.
+        particles = self._detect_obstacle_particles()
+        self._populate_grid(particles)
+
         # If we have a target but no current path (for example an initial plan
-        # failed, or the previous path was cleared), retry planning now instead
-        # of waiting for an obstacle-blocked path event. This ensures a failed
-        # attempt does not permanently stop navigation.
+        # failed, or the previous path was cleared), plan now on the freshly
+        # populated grid — but only after the backoff has elapsed, so a
+        # persistently unreachable goal is not hammered every scan.
         if not self._current_path:
+            if now < self._replan_backoff_until:
+                return
             logging.info(
                 "No current path to target (%.1f, %.1f); attempting to plan.",
                 self._nav_target[0],
                 self._nav_target[1],
             )
-            self._plan_and_publish()
+            if not self._plan_and_publish():
+                self._replan_backoff_until = now + _REPLAN_BACKOFF_S
+            return
 
-        centers = self._detect_obstacles()
-        now = time.time()
-        merge_radius_px = _OBSTACLE_MERGE_RADIUS_M / self.scale_m_per_px
-        updated_keys: set = set()
+        # Only replan if a particle actually blocks the remaining path; there is
+        # no need to issue a new plan for particles behind the robot or far from
+        # the current route.
+        blocked_idx = self._first_blocked_segment_index(particles)
 
-        # Update existing tracks or create new ones for each candidate.
-        for cx, cy in centers:
-            key = self._find_nearest_tracked_obstacle(cx, cy, merge_radius_px)
-            if key is not None:
-                obs = self._dynamic_obstacles[key]
-                n = obs["confidence"]
-                obs["center"] = (
-                    (obs["center"][0] * n + cx) / (n + 1),
-                    (obs["center"][1] * n + cy) / (n + 1),
-                )
-                obs["confidence"] = n + 1
-                obs["last_seen"] = now
-                updated_keys.add(key)
-            else:
-                key = f"{round(cx)}:{round(cy)}:{now:.4f}"
-                self._dynamic_obstacles[key] = {
-                    "center": (cx, cy),
-                    "confidence": 1,
-                    "last_seen": now,
-                }
-                updated_keys.add(key)
+        if blocked_idx is None:
+            # Path is clear. If a previous repair failed and we have been
+            # waiting for the blockage to clear, resume now.
+            if self._failed_blocked_idx is not None:
+                self._failed_blocked_idx = None
+                logging.info("Obstacle cleared; replanning from current pose.")
+                self._plan_and_publish()
+            return
 
-        # Decay obstacles that were not updated this scan.
-        for key in list(self._dynamic_obstacles.keys()):
-            if key in updated_keys:
-                continue
-            obs = self._dynamic_obstacles[key]
-            age = now - obs["last_seen"]
-            max_age = (
-                _OBSTACLE_DECAY_AGE_S
-                if obs["confidence"] >= _OBSTACLE_CONFIRM_SCANS
-                else _OBSTACLE_CANDIDATE_DECAY_AGE_S
-            )
-            if age > max_age:
-                del self._dynamic_obstacles[key]
+        # Same blockage we already failed to route around: wait for the world to
+        # change instead of re-running RRT every scan.
+        if blocked_idx == self._failed_blocked_idx:
+            return
 
-        # Recompute confirmed set.
-        new_confirmed = {
-            key
-            for key, obs in self._dynamic_obstacles.items()
-            if obs["confidence"] >= _OBSTACLE_CONFIRM_SCANS
-        }
-        confirmed_changed = new_confirmed != self._confirmed_obstacle_keys
-        self._confirmed_obstacle_keys = new_confirmed
-
-        if confirmed_changed:
-            self._rebuild_occupancy_grid()
-            logging.info(
-                "Confirmed obstacle set changed (%d confirmed).",
-                len(self._confirmed_obstacle_keys),
-            )
-
-        # Only replan if the remaining path is actually blocked. Rebuilding the
-        # grid on every confirmed-set change keeps the world model up to date,
-        # but there is no need to issue a new plan for obstacles behind the
-        # robot or far from the current route.
-        path_blocked = False
-        for key in self._confirmed_obstacle_keys:
-            cx, cy = self._dynamic_obstacles[key]["center"]
-            if self._obstacle_blocks_remaining_path(cx, cy):
-                logging.info(
-                    "Confirmed obstacle at (%.1f, %.1f) blocks remaining path; replanning.",
-                    cx,
-                    cy,
-                )
-                path_blocked = True
-                break
-
-        if path_blocked:
-            self._repair_path()
+        logging.info(
+            "Obstacle particle blocks remaining path segment %d; replanning.",
+            blocked_idx,
+        )
+        if self._repair_path(blocked_idx):
+            self._failed_blocked_idx = None
+        else:
+            self._failed_blocked_idx = blocked_idx
+            self._replan_backoff_until = now + _REPLAN_BACKOFF_S
 
     # -------------------------------------------------------------------
     # Main loop

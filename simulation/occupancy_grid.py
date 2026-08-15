@@ -46,23 +46,23 @@ class OccupancyGrid:
     Cells are ``True`` if occupied and ``False`` if free. Out-of-bounds is
     treated as occupied so that rays leaving the map stop there.
 
-    The grid uses a world-to-grid offset so that the grid itself starts at
-    index (0, 0) regardless of whether world coordinates start at a negative
-    or positive minimum.  ``origin_world`` is the world-coordinate position
-    of grid cell (0, 0).
+    All world coordinates are in meters.  The grid uses a world-to-grid offset
+    so that the grid itself starts at index (0, 0) regardless of whether world
+    coordinates start at a negative or positive minimum.  ``origin_world`` is
+    the world-coordinate position (meters) of grid cell (0, 0).
     """
 
     def __init__(
         self,
         min_x: float,
         min_y: float,
-        width_px: float,
-        height_px: float,
-        resolution_px: float,
+        width: float,
+        height: float,
+        resolution: float,
     ):
-        self.resolution = resolution_px
-        self.cols = int(math.ceil(width_px / resolution_px))
-        self.rows = int(math.ceil(height_px / resolution_px))
+        self.resolution = resolution
+        self.cols = int(math.ceil(width / resolution))
+        self.rows = int(math.ceil(height / resolution))
         self.grid = np.zeros((self.rows, self.cols), dtype=bool)
 
         # World position of grid cell (0, 0).
@@ -73,18 +73,20 @@ class OccupancyGrid:
     def from_walls(
         cls,
         walls: Sequence[Wall],
-        resolution_px: float = 5.0,
-        margin_px: float = 20.0,
+        resolution: float = 0.25,
+        margin: float = 1.0,
     ) -> "OccupancyGrid":
         """Build an occupancy grid by rasterizing wall segments.
 
         The grid bounds are computed automatically from the wall geometry so
         that coordinates may be negative (after origin rebasing) without issue.
         A small margin is added to prevent paths from hugging the grid edge.
+        ``resolution`` is the cell size in meters; ``margin`` the border in
+        meters.
         """
         if not walls:
             # Trivial empty grid.
-            grid = cls(0.0, 0.0, 100.0, 100.0, resolution_px)
+            grid = cls(0.0, 0.0, 100.0, 100.0, resolution)
             return grid
 
         # Compute the bounding box of all wall vertices.
@@ -93,10 +95,10 @@ class OccupancyGrid:
         min_y = min(min(w.y1, w.y2) for w in walls)
         max_y = max(max(w.y1, w.y2) for w in walls)
 
-        width = (max_x - min_x) + 2.0 * margin_px
-        height = (max_y - min_y) + 2.0 * margin_px
+        width = (max_x - min_x) + 2.0 * margin
+        height = (max_y - min_y) + 2.0 * margin
 
-        grid = cls(min_x - margin_px, min_y - margin_px, width, height, resolution_px)
+        grid = cls(min_x - margin, min_y - margin, width, height, resolution)
 
         for wall in walls:
             x0, y0 = grid.world_to_grid(wall.x1, wall.y1)
@@ -125,7 +127,7 @@ class OccupancyGrid:
         return True
 
     def mark_circle(self, cx: float, cy: float, radius: float) -> None:
-        """Mark a circular region as occupied (e.g., a detected obstacle).
+        """Mark a circular region (meters) as occupied (e.g., a detected obstacle).
 
         This is used by the navigator to add dynamically-detected obstacles
         to the grid so subsequent plans route around them.
@@ -179,8 +181,8 @@ class OccupancyGrid:
     ) -> Optional[float]:
         """Return distance to the nearest occupied cell, or None if no hit.
 
-        Uses a 2D DDA traversal. Distances are in the same units as the grid
-        resolution (usually map pixels).
+        Uses a 2D DDA traversal. Distances are in meters (the same units as
+        the grid resolution).
         """
         ox, oy = origin
 

@@ -1,10 +1,13 @@
 #!/bin/bash
 
 # 1. Catch Ctrl+C (SIGINT) and exit signals (SIGTERM)
-# This kills all background processes running in this script's process group
-trap 'echo "Stopping all programs..."; kill 0' SIGINT SIGTERM
+# This kills all background processes running in this script's process group.
+# The trap is reset first so that the kill signal we send does not re-trigger it.
+trap 'trap - SIGINT SIGTERM; echo "Stopping all programs..."; kill 0' SIGINT SIGTERM
 
 # 2. Start your infinite programs in the background
+python3 zenoh/control/drive.py &
+python3 zenoh/control/controller.py &
 python3 zenoh/pose_estimation/pose_estimator.py home.json &
 python3 zenoh/navigation/navigator.py home.json &
 python3 zenoh/apriltag_detection/detector.py &

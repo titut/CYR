@@ -20,14 +20,16 @@ Controls:
 
 Zenoh topics:
     Published:
-        sensor/lidar       — LIDAR scan data (list of {angle_rad, distance_m})
-        sensor/wheel_speed — {linear_mps, angular_rps}
-        sensor/imu         — {yaw_rad, pitch_rad, roll_rad, ...}
-        nav/goal           — {x_px, y_px} user-clicked map target
-        nav/command        — string, LLM text command from chat bar
+        sensor/lidar         — {"t": float, "rays": [{angle_rad, distance_m}]}
+        sensor/imu           — {"t": float, yaw_rad, pitch_rad, roll_rad, ...}
+        sensor/camera/apriltag — {"t": float, "detections": [{id, range_m, ...}]}
+        sensor/wasd          — {"w","a","s","d"} booleans, raw teleop key state
+        nav/goal             — {x_m, y_m} user-clicked map target (meters)
+        nav/command          — string, LLM text command from chat bar
     Subscribed:
-        estimate/pose      — external pose estimate {x_px, y_px, theta_rad}
-        nav/path           — planned waypoints [[x, y], ...]
+        estimate/pose        — external pose estimate {x_m, y_m, theta_rad, t}
+        nav/path             — planned waypoints [[x, y], ...] (meters)
+        sensor/wheel_speed   — measured wheel speeds {left_rps, right_rps, t}
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ import os
 import random
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -52,6 +55,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from map_format import MapData, Obstacle, Wall, new_empty_map
+from simulation.kinematics import BOT_RADIUS_M, wheel_to_unicycle
 from simulation.raycast import RayHit, cast_rays
 
 # ---------------------------------------------------------------------------
@@ -64,9 +68,6 @@ TAB_BAR_HEIGHT = 44
 CHAT_BAR_HEIGHT = 36
 FPS = 60
 
-BOT_SIZE_M = 1.0
-BOT_LINEAR_SPEED_MPS = 1.5
-BOT_ANGULAR_SPEED_RPS = 2.0
 LIDAR_MAX_RANGE_M = 10.0
 LIDAR_RAY_COUNT = 360
 
@@ -99,7 +100,10 @@ COLORS = {
     "obstacle_outline": (180, 60, 0),
 }
 
-# Wheel slip simulation for autonomous navigation.
+# Wheel slip simulation.  Slip is a wheel-ground interaction, so it is applied
+# here in the physics step (not in the drive node, which only models the motor
+# and encoder).  It corrupts the ground-truth motion relative to what the wheel
+# encoders report, so odometry (integrated encoder speeds) drifts from truth.
 _SLIP_BIAS_MIN = 0.80
 _SLIP_BIAS_MAX = 1.20
 _SLIP_NOISE = 0.10
@@ -134,33 +138,36 @@ def rotate_point(
     )
 
 
-def point_to_segment_distance(px: float, py: float, wall: Wall) -> float:
-    """Distance from point (px, py) to the wall segment."""
+def point_to_segment_distance(x: float, y: float, wall: Wall) -> float:
+    """Distance from point (x, y) to the wall segment."""
     wx = wall.x2 - wall.x1
     wy = wall.y2 - wall.y1
     length_sq = wx * wx + wy * wy
     if length_sq == 0:
-        return math.hypot(px - wall.x1, py - wall.y1)
-    t = max(0.0, min(1.0, ((px - wall.x1) * wx + (py - wall.y1) * wy) / length_sq))
+        return math.hypot(x - wall.x1, y - wall.y1)
+    t = max(0.0, min(1.0, ((x - wall.x1) * wx + (y - wall.y1) * wy) / length_sq))
     proj_x = wall.x1 + t * wx
     proj_y = wall.y1 + t * wy
-    return math.hypot(px - proj_x, py - proj_y)
+    return math.hypot(x - proj_x, y - proj_y)
 
 
 def bot_collides(
     bot_pos: Tuple[float, float],
-    radius_px: float,
+    radius: float,
     walls: List[Wall],
     obstacles: Optional[List[Obstacle]] = None,
 ) -> bool:
-    """Check whether a circular bot collides with any wall or obstacle."""
+    """Check whether a circular bot collides with any wall or obstacle.
+
+    All coordinates and radii are in meters.
+    """
     for wall in walls:
-        if point_to_segment_distance(bot_pos[0], bot_pos[1], wall) < radius_px:
+        if point_to_segment_distance(bot_pos[0], bot_pos[1], wall) < radius:
             return True
     if obstacles:
         for obstacle in obstacles:
             d = math.hypot(bot_pos[0] - obstacle.x, bot_pos[1] - obstacle.y)
-            if d < radius_px + obstacle.radius_px:
+            if d < radius + obstacle.radius_m:
                 return True
     return False
 
@@ -185,21 +192,24 @@ class Simulator:
         self.font = pygame.font.SysFont("Helvetica", 16)
         self.big_font = pygame.font.SysFont("Helvetica", 20, bold=True)
 
-        self.map_data = self._load_map(map_path)
-        self.scale_m_per_px = self.map_data.metadata.scale_m_per_px
-        self.bot_radius_px = (BOT_SIZE_M / 2.0) / self.scale_m_per_px
+        raw_map = self._load_map(map_path)
+        # Remember the pixels-per-meter ratio so we can render the meter world
+        # to screen.  The map is stored in meters; scale_m_per_px is only the
+        # editor's canvas calibration.
+        self.px_per_m = 1.0 / raw_map.metadata.scale_m_per_px
+        self.map_data = raw_map
+        self.bot_radius_m = BOT_RADIUS_M
 
-        # Bot state in map pixels and radians.
+        # Bot state in meters and radians.
         start_center = (
             polygon_center(self.map_data.rooms[0].polygon)
             if self.map_data.rooms
-            else (400.0, 300.0)
+            else (20.0, 15.0)
         )
         self.bot_x, self.bot_y = start_center
         self.bot_theta = 0.0
         self.linear_velocity = 0.0
         self.angular_velocity = 0.0
-
         # External pose estimate (received from estimate/pose).
         self._est_lock = threading.Lock()
         self.guess_x, self.guess_y = self.bot_x, self.bot_y
@@ -219,10 +229,14 @@ class Simulator:
         # Wheel slip simulation: random calibration bias per run.
         self._slip_bias = random.uniform(_SLIP_BIAS_MIN, _SLIP_BIAS_MAX)
 
-        # Navigation state (path received from navigator over Zenoh).
+        # Measured wheel speeds from the drive node (rad/s).
+        self._wheel_lock = threading.Lock()
+        self._left_rps = 0.0
+        self._right_rps = 0.0
+
+        # Navigation state (path received from navigator over Zenoh, for display).
         self.nav_target: Optional[Tuple[float, float]] = None
         self.nav_path: List[Tuple[float, float]] = []
-        self.nav_path_index: int = 0
 
         # Chat bar state.
         self._chat_active = False
@@ -238,8 +252,8 @@ class Simulator:
             congestion_control=zenoh.CongestionControl.DROP,
             reliability=zenoh.Reliability.BEST_EFFORT,
         )
-        self._pub_wheel_speed = self._zenoh_session.declare_publisher(
-            "sensor/wheel_speed",
+        self._pub_wasd = self._zenoh_session.declare_publisher(
+            "sensor/wasd",
             congestion_control=zenoh.CongestionControl.DROP,
             reliability=zenoh.Reliability.BEST_EFFORT,
         )
@@ -275,6 +289,9 @@ class Simulator:
         self._sub_path = self._zenoh_session.declare_subscriber(
             "nav/path", self._on_nav_path
         )
+        self._sub_wheel = self._zenoh_session.declare_subscriber(
+            "sensor/wheel_speed", self._on_wheel_speed
+        )
 
     @staticmethod
     def _load_map(path: Path) -> MapData:
@@ -292,26 +309,34 @@ class Simulator:
         try:
             data = json.loads(sample.payload.to_string())
             with self._est_lock:
-                self.guess_x = float(data["x_px"])
-                self.guess_y = float(data["y_px"])
+                self.guess_x = float(data["x_m"])
+                self.guess_y = float(data["y_m"])
                 self.guess_theta = float(data["theta_rad"])
         except (json.JSONDecodeError, KeyError, Exception) as exc:
             logging.warning("Failed to parse estimate/pose: %s", exc)
 
     def _on_nav_path(self, sample):
-        """Receive planned path from navigator."""
+        """Receive planned path from navigator (for display only)."""
         try:
             waypoints = json.loads(sample.payload.to_string())
             if not waypoints:
                 logging.warning("Navigator returned empty path.")
                 self.nav_path = []
-                self.nav_path_index = 0
                 return
             self.nav_path = [tuple(p) for p in waypoints]
-            self.nav_path_index = 0
             logging.info("Received path with %d waypoints.", len(self.nav_path))
         except (json.JSONDecodeError, Exception) as exc:
             logging.warning("Failed to parse nav/path: %s", exc)
+
+    def _on_wheel_speed(self, sample):
+        """Receive measured wheel speeds from the drive node."""
+        try:
+            data = json.loads(sample.payload.to_string())
+            with self._wheel_lock:
+                self._left_rps = float(data["left_rps"])
+                self._right_rps = float(data["right_rps"])
+        except (json.JSONDecodeError, KeyError, Exception) as exc:
+            logging.warning("Failed to parse sensor/wheel_speed: %s", exc)
 
     # -----------------------------------------------------------------------
     # Publishing
@@ -319,30 +344,24 @@ class Simulator:
 
     def _publish_zenoh(self):
         """Publish sensor data over Zenoh."""
-        # Wheel speed: clean encoder-reported values.
-        wheel_msg = json.dumps(
-            {
-                "linear_mps": self.linear_velocity * self.scale_m_per_px,
-                "angular_rps": self.angular_velocity,
-            }
-        )
-        self._pub_wheel_speed.put(wheel_msg)
+        now = time.time()
 
         # LIDAR.
         lidar_msg = json.dumps(
-            [
-                {
-                    "angle_rad": hit.angle,
-                    "distance_m": hit.distance * self.scale_m_per_px,
-                }
-                for hit in self.lidar_hits
-            ]
+            {
+                "t": now,
+                "rays": [
+                    {"angle_rad": hit.angle, "distance_m": hit.distance}
+                    for hit in self.lidar_hits
+                ],
+            }
         )
         self._pub_lidar.put(lidar_msg)
 
         # IMU.
         imu_msg = json.dumps(
             {
+                "t": now,
                 "yaw_rad": self.bot_theta,
                 "pitch_rad": 0.0,
                 "roll_rad": 0.0,
@@ -414,12 +433,11 @@ class Simulator:
                     self.zoom,
                 )
                 # Publish nav/goal so the navigator plans a path.
-                self._pub_goal.put(json.dumps({"x_px": world[0], "y_px": world[1]}))
+                self._pub_goal.put(json.dumps({"x_m": world[0], "y_m": world[1]}))
                 self.nav_target = world
             elif event.button == 3 and self.active_tab == 0:
                 self.nav_target = None
                 self.nav_path = []
-                self.nav_path_index = 0
 
     # -----------------------------------------------------------------------
     # Update
@@ -428,43 +446,30 @@ class Simulator:
     def _update(self, dt: float):
         keys = pygame.key.get_pressed()
 
-        # ---- Autonomous navigation (path received from navigator) ----
-        if self.nav_path and not (
-            keys[pygame.K_w] or keys[pygame.K_s] or keys[pygame.K_a] or keys[pygame.K_d]
-        ):
-            self._update_navigation(dt)
-        else:
-            # ---- Manual mode (WASD) ----
-            if any(keys[k] for k in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d)):
-                self.nav_path = []
-                self.nav_path_index = 0
+        # Publish raw teleop key state for the controller node.
+        wasd = {
+            "w": bool(keys[pygame.K_w]),
+            "a": bool(keys[pygame.K_a]),
+            "s": bool(keys[pygame.K_s]),
+            "d": bool(keys[pygame.K_d]),
+        }
+        self._pub_wasd.put(json.dumps(wasd))
 
-            if keys[pygame.K_w]:
-                self.linear_velocity = BOT_LINEAR_SPEED_MPS / self.scale_m_per_px
-            elif keys[pygame.K_s]:
-                self.linear_velocity = -BOT_LINEAR_SPEED_MPS / self.scale_m_per_px
-            else:
-                self.linear_velocity = 0.0
+        # Drive the bot from the measured wheel speeds published by the drive
+        # node.  The drive node reports encoder values (motor + encoder error);
+        # wheel-ground slip is applied here, in the physics step.
+        with self._wheel_lock:
+            left_rps, right_rps = self._left_rps, self._right_rps
+        linear, angular = wheel_to_unicycle(left_rps, right_rps)
 
-            if keys[pygame.K_a]:
-                self.angular_velocity = -BOT_ANGULAR_SPEED_RPS
-            elif keys[pygame.K_d]:
-                self.angular_velocity = BOT_ANGULAR_SPEED_RPS
-            else:
-                self.angular_velocity = 0.0
+        actual_linear = linear * self._slip_bias
+        actual_angular = angular * self._slip_bias
+        actual_angular += actual_linear * _CROSS_COUPLING_RAD_PER_M
+        actual_linear += random.gauss(0.0, _SLIP_NOISE * abs(actual_linear))
+        actual_angular += random.gauss(0.0, _SLIP_NOISE * abs(actual_angular))
 
-        # ---- Apply wheel slip to actual movement (autonomous only) ----
-        actual_linear = self.linear_velocity
-        actual_angular = self.angular_velocity
-
-        if self.nav_path and (actual_linear != 0.0 or actual_angular != 0.0):
-            actual_linear *= self._slip_bias
-            actual_angular *= self._slip_bias
-            actual_angular += (
-                actual_linear * self.scale_m_per_px * _CROSS_COUPLING_RAD_PER_M
-            )
-            actual_linear += random.gauss(0.0, _SLIP_NOISE * abs(actual_linear))
-            actual_angular += random.gauss(0.0, _SLIP_NOISE * abs(actual_angular))
+        self.linear_velocity = actual_linear
+        self.angular_velocity = actual_angular
 
         new_theta = self.bot_theta + actual_angular * dt
         new_x = self.bot_x + actual_linear * math.cos(self.bot_theta) * dt
@@ -472,11 +477,11 @@ class Simulator:
 
         obstacles = self.map_data.obstacles
         if not bot_collides(
-            (new_x, self.bot_y), self.bot_radius_px, self.map_data.walls, obstacles
+            (new_x, self.bot_y), self.bot_radius_m, self.map_data.walls, obstacles
         ):
             self.bot_x = new_x
         if not bot_collides(
-            (self.bot_x, new_y), self.bot_radius_px, self.map_data.walls, obstacles
+            (self.bot_x, new_y), self.bot_radius_m, self.map_data.walls, obstacles
         ):
             self.bot_y = new_y
         self.bot_theta = new_theta
@@ -489,7 +494,7 @@ class Simulator:
             forward_direction=self.bot_theta,
             walls=self.map_data.walls,
             num_rays=LIDAR_RAY_COUNT,
-            max_range=LIDAR_MAX_RANGE_M / self.scale_m_per_px,
+            max_range=LIDAR_MAX_RANGE_M,
             fov_rad=2.0 * math.pi,
             obstacles=self.map_data.obstacles,
         )
@@ -508,15 +513,15 @@ class Simulator:
         noisy range/bearing so the pose estimator can anchor its filter.
         """
         detections = []
-        max_range_px = CAMERA_MAX_RANGE_M / self.scale_m_per_px
+        max_range_m = CAMERA_MAX_RANGE_M
         half_fov = CAMERA_FOV_RAD / 2.0
 
         for tag in self.map_data.apriltags:
             # Vector from bot to tag in world coordinates.
             dx = tag.x - self.bot_x
             dy = tag.y - self.bot_y
-            dist_px = math.hypot(dx, dy)
-            if dist_px > max_range_px:
+            dist_m = math.hypot(dx, dy)
+            if dist_m > max_range_m:
                 continue
 
             # Bearing of the tag relative to the bot's forward direction.
@@ -530,9 +535,7 @@ class Simulator:
                 continue
 
             # Add Gaussian noise to simulate real camera measurement.
-            noisy_range_m = dist_px * self.scale_m_per_px + random.gauss(
-                0.0, CAMERA_RANGE_NOISE_M
-            )
+            noisy_range_m = dist_m + random.gauss(0.0, CAMERA_RANGE_NOISE_M)
             noisy_bearing = bearing + random.gauss(0.0, CAMERA_BEARING_NOISE_RAD)
 
             # The tag's yaw relative to the camera (used to derive robot pose).
@@ -553,50 +556,9 @@ class Simulator:
             )
 
         if detections:
-            self._pub_camera_apriltag.put(json.dumps(detections))
-
-    # -----------------------------------------------------------------------
-    # Navigation (path-following only; planning is external)
-    # -----------------------------------------------------------------------
-
-    def _update_navigation(self, dt: float):
-        """Follow the path received from the navigator."""
-        if not self.nav_path or self.nav_path_index >= len(self.nav_path):
-            self.linear_velocity = 0.0
-            self.angular_velocity = 0.0
-            self.nav_path = []
-            return
-
-        gx, gy = self.guess_x, self.guess_y
-        wp = self.nav_path[self.nav_path_index]
-        to_wp = math.hypot(wp[0] - gx, wp[1] - gy)
-
-        target_heading = math.atan2(wp[1] - gy, wp[0] - gx)
-        angle_err = math.atan2(
-            math.sin(target_heading - self.bot_theta),
-            math.cos(target_heading - self.bot_theta),
-        )
-
-        if abs(angle_err) > 0.05:
-            self.angular_velocity = max(
-                -BOT_ANGULAR_SPEED_RPS,
-                min(BOT_ANGULAR_SPEED_RPS, 4.0 * angle_err),
+            self._pub_camera_apriltag.put(
+                json.dumps({"t": time.time(), "detections": detections})
             )
-            self.linear_velocity = 0.0
-        else:
-            self.angular_velocity = 4.0 * angle_err
-            speed = BOT_LINEAR_SPEED_MPS / self.scale_m_per_px
-            if to_wp < self.bot_radius_px * 4:
-                speed *= max(0.2, to_wp / (self.bot_radius_px * 4))
-            self.linear_velocity = speed
-
-        if to_wp < self.bot_radius_px * 1.5:
-            self.nav_path_index += 1
-            if self.nav_path_index >= len(self.nav_path):
-                self.linear_velocity = 0.0
-                self.angular_velocity = 0.0
-                self.nav_path = []
-                self.nav_target = None
 
     # -----------------------------------------------------------------------
     # Chat bar
@@ -707,16 +669,16 @@ class Simulator:
     def _world_to_screen(self, point, content_rect, camera, zoom):
         cx, cy = camera
         return (
-            content_rect.centerx + (point[0] - cx) * zoom,
-            content_rect.centery + (point[1] - cy) * zoom,
+            content_rect.centerx + (point[0] - cx) * self.px_per_m * zoom,
+            content_rect.centery + (point[1] - cy) * self.px_per_m * zoom,
         )
 
     def _screen_to_world(self, screen_pos, content_rect, camera, zoom):
         sx, sy = screen_pos
         cx, cy = camera
         return (
-            (sx - content_rect.centerx) / zoom + cx,
-            (sy - content_rect.centery) / zoom + cy,
+            (sx - content_rect.centerx) / (self.px_per_m * zoom) + cx,
+            (sy - content_rect.centery) / (self.px_per_m * zoom) + cy,
         )
 
     def _world_to_screen_rotated(
@@ -726,8 +688,10 @@ class Simulator:
         rotation = -(forward_theta + math.pi / 2.0)
         cos_a, sin_a = math.cos(rotation), math.sin(rotation)
         return (
-            content_rect.centerx + (dx * cos_a - dy * sin_a) * zoom,
-            content_rect.centery + (dx * sin_a + dy * cos_a) * zoom,
+            content_rect.centerx
+            + (dx * cos_a - dy * sin_a) * self.px_per_m * zoom,
+            content_rect.centery
+            + (dx * sin_a + dy * cos_a) * self.px_per_m * zoom,
         )
 
     # -----------------------------------------------------------------------
@@ -759,7 +723,7 @@ class Simulator:
             sc = self._world_to_screen(
                 (obstacle.x, obstacle.y), content_rect, camera, zoom
             )
-            radius = obstacle.radius_px * zoom
+            radius = obstacle.radius_m * self.px_per_m * zoom
             pygame.draw.circle(self.screen, COLORS["obstacle"], sc, max(1, int(radius)))
             pygame.draw.circle(
                 self.screen, COLORS["obstacle_outline"], sc, max(1, int(radius)), 2
@@ -771,18 +735,18 @@ class Simulator:
         Tags within the camera's detection cone are highlighted yellow;
         out-of-range tags are drawn in a muted green.
         """
-        max_range_px = CAMERA_MAX_RANGE_M / self.scale_m_per_px
+        max_range_m = CAMERA_MAX_RANGE_M
         half_fov = CAMERA_FOV_RAD / 2.0
 
         for tag in self.map_data.apriltags:
             sc = self._world_to_screen((tag.x, tag.y), content_rect, camera, zoom)
-            half = max(3.0, (tag.size_m / self.scale_m_per_px) * zoom / 2.0)
+            half = max(3.0, (tag.size_m * self.px_per_m) * zoom / 2.0)
 
             # Check if this tag is currently detected.
             dx = tag.x - self.bot_x
             dy = tag.y - self.bot_y
             dist = math.hypot(dx, dy)
-            within_range = dist <= max_range_px
+            within_range = dist <= max_range_m
             angle_to_tag = math.atan2(dy, dx)
             bearing = math.atan2(
                 math.sin(angle_to_tag - self.bot_theta),
@@ -814,19 +778,19 @@ class Simulator:
         bot_screen = self._world_to_screen(
             (self.bot_x, self.bot_y), content_rect, camera, zoom
         )
-        max_range_px = CAMERA_MAX_RANGE_M / self.scale_m_per_px
+        max_range_m = CAMERA_MAX_RANGE_M
         half_fov = CAMERA_FOV_RAD / 2.0
 
         left_angle = self.bot_theta - half_fov
         right_angle = self.bot_theta + half_fov
 
         left_pt = (
-            self.bot_x + max_range_px * math.cos(left_angle),
-            self.bot_y + max_range_px * math.sin(left_angle),
+            self.bot_x + max_range_m * math.cos(left_angle),
+            self.bot_y + max_range_m * math.sin(left_angle),
         )
         right_pt = (
-            self.bot_x + max_range_px * math.cos(right_angle),
-            self.bot_y + max_range_px * math.sin(right_angle),
+            self.bot_x + max_range_m * math.cos(right_angle),
+            self.bot_y + max_range_m * math.sin(right_angle),
         )
 
         left_s = self._world_to_screen(left_pt, content_rect, camera, zoom)
@@ -880,8 +844,9 @@ class Simulator:
         cx, cy = content_rect.center
         for hit in self.lidar_hits:
             sa = hit.angle - math.pi / 2.0
-            sx = cx + hit.distance * math.cos(sa)
-            sy = cy + hit.distance * math.sin(sa)
+            r_px = hit.distance * self.px_per_m
+            sx = cx + r_px * math.cos(sa)
+            sy = cy + r_px * math.sin(sa)
             pygame.draw.circle(
                 self.screen, COLORS["lidar_point"], (int(sx), int(sy)), 2
             )
@@ -890,7 +855,7 @@ class Simulator:
             )
         self._draw_bot_at_center(content_rect, COLORS["bot_true"])
         for r_m in (2, 4, 6, 8, 10):
-            r_px = int(r_m / self.scale_m_per_px)
+            r_px = int(r_m * self.px_per_m)
             pygame.draw.circle(self.screen, (200, 200, 200), (cx, cy), r_px, 1)
             label = self.font.render(f"{r_m}m", True, (150, 150, 150))
             self.screen.blit(label, (cx + 5, cy - r_px - 16))
@@ -921,28 +886,26 @@ class Simulator:
     # -----------------------------------------------------------------------
 
     def _draw_grid(self, content_rect, camera, zoom):
-        spacing = 50
+        spacing = 2.5  # meters between grid lines
         cam_x, cam_y = camera
-        w2 = content_rect.width / (2 * zoom)
-        h2 = content_rect.height / (2 * zoom)
-        sx, ex = (
-            int((cam_x - w2) / spacing) * spacing,
-            int((cam_x + w2) / spacing) * spacing,
-        )
-        sy, ey = (
-            int((cam_y - h2) / spacing) * spacing,
-            int((cam_y + h2) / spacing) * spacing,
-        )
-        for x in range(sx, ex + spacing, spacing):
-            sx2, _ = self._world_to_screen((x, 0), content_rect, camera, zoom)
+        w2 = content_rect.width / (2 * zoom * self.px_per_m)
+        h2 = content_rect.height / (2 * zoom * self.px_per_m)
+
+        x_start = math.floor((cam_x - w2) / spacing)
+        x_end = math.ceil((cam_x + w2) / spacing)
+        for i in range(x_start, x_end + 1):
+            sx2, _ = self._world_to_screen((i * spacing, 0), content_rect, camera, zoom)
             pygame.draw.line(
                 self.screen,
                 COLORS["grid"],
                 (sx2, content_rect.top),
                 (sx2, content_rect.bottom),
             )
-        for y in range(sy, ey + spacing, spacing):
-            _, sy2 = self._world_to_screen((0, y), content_rect, camera, zoom)
+
+        y_start = math.floor((cam_y - h2) / spacing)
+        y_end = math.ceil((cam_y + h2) / spacing)
+        for j in range(y_start, y_end + 1):
+            _, sy2 = self._world_to_screen((0, j * spacing), content_rect, camera, zoom)
             pygame.draw.line(
                 self.screen,
                 COLORS["grid"],
@@ -1016,7 +979,7 @@ class Simulator:
     def _draw_bot(self, content_rect, camera, zoom, pose, color):
         x, y, theta = pose
         center = self._world_to_screen((x, y), content_rect, camera, zoom)
-        radius = self.bot_radius_px * zoom
+        radius = self.bot_radius_m * self.px_per_m * zoom
         half = radius
         corners = [(half, -half), (half, half), (-half, half), (-half, -half)]
         rotated = [rotate_point(c, theta) for c in corners]
@@ -1031,7 +994,7 @@ class Simulator:
 
     def _draw_bot_at_center(self, content_rect, color):
         cx, cy = content_rect.center
-        radius = self.bot_radius_px
+        radius = self.bot_radius_m * self.px_per_m
         half = radius
         theta_s = -math.pi / 2.0
         corners = [(half, -half), (half, half), (-half, half), (-half, -half)]

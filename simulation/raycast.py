@@ -74,7 +74,7 @@ def _ray_circle_intersection(
     # Solve |v + t*d|^2 = r^2  (d is a unit vector):
     #   t^2 + 2*(v·d)*t + |v|^2 - r^2 = 0
     b = 2.0 * (vx * dx + vy * dy)
-    c = vx * vx + vy * vy - obstacle.radius_px * obstacle.radius_px
+    c = vx * vx + vy * vy - obstacle.radius_m * obstacle.radius_m
 
     discriminant = b * b - 4.0 * c
     if discriminant < 0.0:
@@ -102,8 +102,8 @@ def cast_ray(
 ) -> Optional[Tuple[float, Tuple[float, float]]]:
     """Cast a single ray and return (distance, hit_point) or None if no hit.
 
-    `max_range` and the returned `distance` are in the same units as the wall
-    coordinates (e.g., pixels or meters, as long as they are consistent).
+    ``origin``, ``max_range`` and the returned ``distance`` are in meters; the
+    ``walls``/``obstacles`` must be expressed in meters as well.
     """
     closest: Optional[float] = None
     for wall in walls:
@@ -138,13 +138,13 @@ def cast_rays(
     """Cast a fan of rays around `origin`.
 
     Args:
-        origin: Ray origin in map coordinates.
+        origin: Ray origin in world coordinates (meters).
         forward_direction: Orientation of the sensor in radians.
-        walls: Wall segments to intersect against.
+        walls: Wall segments to intersect against (meters).
         num_rays: Number of evenly spaced rays.
-        max_range: Maximum range in the same units as wall coordinates.
+        max_range: Maximum range in meters.
         fov_rad: Total field of view in radians. Use 2*pi for 360 degree LIDAR.
-        obstacles: Optional circular obstacles to intersect against.
+        obstacles: Optional circular obstacles to intersect against (meters).
 
     Returns:
         A list of RayHit objects, one per ray. Rays that hit nothing are omitted.

@@ -54,8 +54,8 @@ def _polygon_area(polygon: List[Tuple[float, float]]) -> float:
 class ParticleFilter:
     """A simple particle filter for 2D LIDAR localization.
 
-    Units follow the map file: x and y are in map pixels; theta is in radians.
-    The caller converts to/from meters using the map scale where needed.
+    Units: x and y are in meters; theta is in radians.  The map data is stored
+    in meters (see map_format).
     """
 
     def __init__(
@@ -65,20 +65,22 @@ class ParticleFilter:
         num_beams: int = 36,
         max_range_m: float = 10.0,
         measurement_sigma_m: float = 0.15,
-        forward_noise_px: float = 0.2,
+        forward_noise_m: float = 0.01,
         theta_noise_rad: float = 0.01,
         random_fraction: float = 0.05,
     ):
         self.map_data = map_data
         self.num_particles = num_particles
         self.num_beams = num_beams
-        self.scale_m_per_px = map_data.metadata.scale_m_per_px
-        self.max_range_px = max_range_m / self.scale_m_per_px
-        self.measurement_sigma_px = measurement_sigma_m / self.scale_m_per_px
+        self.max_range = max_range_m
+        self.measurement_sigma = measurement_sigma_m
 
-        self.forward_noise_px = forward_noise_px
+        self.forward_noise_m = forward_noise_m
         self.theta_noise_rad = theta_noise_rad
         self.random_fraction = random_fraction
+
+        # Radius of the local random-injection disc used after an anchor.
+        self.local_inject_radius_m = 2.0
 
         # Beam angles relative to the particle's forward direction.
         self.beam_angles = np.linspace(-math.pi, math.pi, num_beams, endpoint=False)
@@ -96,7 +98,7 @@ class ParticleFilter:
         rooms = self.map_data.rooms
         if not rooms:
             # Fall back to the canvas bounding box; reject points inside walls.
-            width, height = self.map_data.metadata.size_px
+            width, height = self.map_data.metadata.size_m
             for i in range(self.num_particles):
                 while True:
                     x = np.random.uniform(0, width)
@@ -130,7 +132,7 @@ class ParticleFilter:
         x: float,
         y: float,
         theta: float,
-        std_xy_px: float = 20.0,
+        std_xy_m: float = 1.0,
         std_theta_rad: float = 0.3,
     ):
         """Initialise particles around a known pose with Gaussian noise.
@@ -143,21 +145,21 @@ class ParticleFilter:
         rooms = self.map_data.rooms
         for i in range(n):
             while True:
-                px = np.random.normal(x, std_xy_px)
-                py = np.random.normal(y, std_xy_px)
+                sx = np.random.normal(x, std_xy_m)
+                sy = np.random.normal(y, std_xy_m)
                 pt = np.random.normal(theta, std_theta_rad)
 
                 if rooms:
                     for room in rooms:
-                        if _point_in_polygon(px, py, room.polygon):
-                            self.particles[i] = [px, py, pt]
+                        if _point_in_polygon(sx, sy, room.polygon):
+                            self.particles[i] = [sx, sy, pt]
                             break
                     else:
                         # Not inside any room — retry.
                         continue
                 else:
-                    if not self._inside_wall(px, py):
-                        self.particles[i] = [px, py, pt]
+                    if not self._inside_wall(sx, sy):
+                        self.particles[i] = [sx, sy, pt]
                     else:
                         # Inside a wall — retry.
                         continue
@@ -172,17 +174,16 @@ class ParticleFilter:
         x: float,
         y: float,
         theta: float,
-        std_xy_px: float = 5.0,
+        std_xy_m: float = 0.25,
         std_theta_rad: float = 0.05,
         fraction: float = 0.3,
     ):
         """Inject a fraction of particles tightly around an anchor pose.
 
         Unlike initialize_near() which replaces ALL particles, this only
-        replaces `fraction` of them, keeping the rest as-is.  This pulls
-        the filter toward the anchor without discarding prior information.
-
-        Call this when an absolute pose measurement (e.g., AprilTag) arrives.
+        replaces `fraction` of them, keeping the rest as-is.  With
+        ``fraction=1.0`` it resets every particle to the anchor pose, so the
+        filter jumps directly to an absolute measurement (e.g., an AprilTag).
         """
         if not self.initialized:
             return
@@ -194,20 +195,20 @@ class ParticleFilter:
         rooms = self.map_data.rooms
         for idx in indices:
             while True:
-                px = np.random.normal(x, std_xy_px)
-                py = np.random.normal(y, std_xy_px)
+                sx = np.random.normal(x, std_xy_m)
+                sy = np.random.normal(y, std_xy_m)
                 pt = np.random.normal(theta, std_theta_rad)
 
                 if rooms:
                     for room in rooms:
-                        if _point_in_polygon(px, py, room.polygon):
-                            self.particles[idx] = [px, py, pt]
+                        if _point_in_polygon(sx, sy, room.polygon):
+                            self.particles[idx] = [sx, sy, pt]
                             break
                     else:
                         continue
                 else:
-                    if not self._inside_wall(px, py):
-                        self.particles[idx] = [px, py, pt]
+                    if not self._inside_wall(sx, sy):
+                        self.particles[idx] = [sx, sy, pt]
                     else:
                         continue
                 break
@@ -219,10 +220,10 @@ class ParticleFilter:
         """Rough check whether a point is inside a wall buffer (not used with rooms)."""
         # Simple bounding-box rejection; adequate for fallback initialization.
         for wall in self.map_data.walls:
-            min_x = min(wall.x1, wall.x2) - 5
-            max_x = max(wall.x1, wall.x2) + 5
-            min_y = min(wall.y1, wall.y2) - 5
-            max_y = max(wall.y1, wall.y2) + 5
+            min_x = min(wall.x1, wall.x2) - 0.25
+            max_x = max(wall.x1, wall.x2) + 0.25
+            min_y = min(wall.y1, wall.y2) - 0.25
+            max_y = max(wall.y1, wall.y2) + 0.25
             if min_x <= x <= max_x and min_y <= y <= max_y:
                 return True
         return False
@@ -231,17 +232,17 @@ class ParticleFilter:
     # Prediction
     # -----------------------------------------------------------------------
 
-    def predict(self, delta_forward_px: float, delta_theta: float):
+    def predict(self, delta_forward_m: float, delta_theta: float):
         """Advance particles by one odometry step with motion noise."""
         if not self.initialized:
             return
 
         n = self.num_particles
         # Motion noise scales with the magnitude of the odometry step.
-        forward_std = max(0.2, 0.1 * abs(delta_forward_px)) + self.forward_noise_px
+        forward_std = max(0.01, 0.1 * abs(delta_forward_m)) + self.forward_noise_m
         theta_std = max(0.005, 0.1 * abs(delta_theta)) + self.theta_noise_rad
 
-        forward_noisy = delta_forward_px + np.random.normal(0.0, forward_std, n)
+        forward_noisy = delta_forward_m + np.random.normal(0.0, forward_std, n)
         theta_noisy = delta_theta + np.random.normal(0.0, theta_std, n)
 
         self.particles[:, 2] += theta_noisy
@@ -268,7 +269,7 @@ class ParticleFilter:
         diff = expected - observed_distances
         raw_lik = np.exp(
             -(diff * diff)
-            / (2.0 * self.measurement_sigma_px * self.measurement_sigma_px)
+            / (2.0 * self.measurement_sigma * self.measurement_sigma)
         )
         likelihoods = raw_lik + 0.001 * np.max(raw_lik, axis=1, keepdims=True)
 
@@ -291,14 +292,14 @@ class ParticleFilter:
         oy = self.particles[:, 1]
         theta = self.particles[:, 2]
 
-        expected = np.full((n, self.num_beams), self.max_range_px)
+        expected = np.full((n, self.num_beams), self.max_range)
 
         for j, rel_angle in enumerate(self.beam_angles):
             directions = theta + rel_angle
             dx = np.cos(directions)
             dy = np.sin(directions)
 
-            closest = np.full(n, self.max_range_px)
+            closest = np.full(n, self.max_range)
 
             for wall in self.map_data.walls:
                 wx = wall.x2 - wall.x1
@@ -319,7 +320,7 @@ class ParticleFilter:
                 hit = valid & (t >= 0) & (u >= 0) & (u <= 1) & (t < closest)
                 closest[hit] = t[hit]
 
-            expected[:, j] = np.minimum(closest, self.max_range_px)
+            expected[:, j] = np.minimum(closest, self.max_range)
 
         return expected
 
@@ -330,7 +331,7 @@ class ParticleFilter:
         Beams where no LIDAR hit lands within the sector stay at max_range so
         they contribute zero information.
         """
-        observed = np.full(self.num_beams, self.max_range_px)
+        observed = np.full(self.num_beams, self.max_range)
         if not observed_hits:
             return observed
 
@@ -353,11 +354,24 @@ class ParticleFilter:
     # Resampling
     # -----------------------------------------------------------------------
 
-    def resample(self):
+    def resample(
+        self,
+        inject_mode: str = "global",
+        anchor: Optional[Tuple[float, float]] = None,
+    ):
         """Resample particles proportional to their weights and add roughening noise.
 
         Uses systematic resampling (stochastic universal sampling) which has
         lower variance than simple multinomial resampling.
+
+        ``inject_mode`` controls where the random sample fraction is drawn
+        from:
+
+        - ``"global"`` — uniform across all rooms (recovers from divergence /
+          kidnapping, but scatters particles across the whole map).
+        - ``"local"`` — a disc of radius ``local_inject_radius_m`` around
+          ``anchor`` (used after a confident absolute measurement such as an
+          AprilTag, so we don't waste particles far from the robot).
         """
         if not self.initialized:
             return
@@ -375,31 +389,75 @@ class ParticleFilter:
 
         # --- Roughening / jittering ---
         # Use small noise so good particles stay near the true pose.
-        self.particles[:, 0] += np.random.normal(0.0, 0.3, n)
-        self.particles[:, 1] += np.random.normal(0.0, 0.3, n)
+        self.particles[:, 0] += np.random.normal(0.0, 0.015, n)
+        self.particles[:, 1] += np.random.normal(0.0, 0.015, n)
         self.particles[:, 2] += np.random.normal(0.0, 0.02, n)
 
         # --- Random sample injection ---
         if self.random_fraction > 0:
             n_random = int(n * self.random_fraction)
-            rooms = self.map_data.rooms
-            if rooms:
-                areas = np.array([_polygon_area(r.polygon) for r in rooms])
-                probs = areas / areas.sum()
-                room_indices = np.random.choice(len(rooms), size=n_random, p=probs)
-                for i, room_idx in enumerate(room_indices):
-                    room = rooms[room_idx]
-                    xs = [p[0] for p in room.polygon]
-                    ys = [p[1] for p in room.polygon]
-                    while True:
-                        x = np.random.uniform(min(xs), max(xs))
-                        y = np.random.uniform(min(ys), max(ys))
-                        if _point_in_polygon(x, y, room.polygon):
-                            break
-                    idx = np.random.randint(n)
-                    self.particles[idx] = [x, y, np.random.uniform(0, 2 * math.pi)]
+            if inject_mode == "local" and anchor is not None:
+                self._inject_local(n_random, anchor[0], anchor[1])
+            else:
+                self._inject_global(n_random)
 
         self.weights = np.ones(n) / n
+
+    def _inject_global(self, n_random: int):
+        """Re-inject particles uniformly across free space (all rooms)."""
+        n = self.num_particles
+        rooms = self.map_data.rooms
+        if not rooms:
+            width, height = self.map_data.metadata.size_m
+            for _ in range(n_random):
+                while True:
+                    x = np.random.uniform(0, width)
+                    y = np.random.uniform(0, height)
+                    if not self._inside_wall(x, y):
+                        break
+                idx = np.random.randint(n)
+                self.particles[idx] = [x, y, np.random.uniform(0, 2 * math.pi)]
+            return
+
+        areas = np.array([_polygon_area(r.polygon) for r in rooms])
+        probs = areas / areas.sum()
+        room_indices = np.random.choice(len(rooms), size=n_random, p=probs)
+        for room_idx in room_indices:
+            room = rooms[room_idx]
+            xs = [p[0] for p in room.polygon]
+            ys = [p[1] for p in room.polygon]
+            while True:
+                x = np.random.uniform(min(xs), max(xs))
+                y = np.random.uniform(min(ys), max(ys))
+                if _point_in_polygon(x, y, room.polygon):
+                    break
+            idx = np.random.randint(n)
+            self.particles[idx] = [x, y, np.random.uniform(0, 2 * math.pi)]
+
+    def _inject_local(self, n_random: int, x: float, y: float):
+        """Re-inject particles in a disc around (x, y) to preserve diversity.
+
+        Uniformly samples the disc of radius ``local_inject_radius_m`` and
+        rejects points that fall outside free space (room polygons).
+        """
+        n = self.num_particles
+        rooms = self.map_data.rooms
+        radius = self.local_inject_radius_m
+        for _ in range(n_random):
+            while True:
+                # Uniform disc sampling: r ~ sqrt(U), angle ~ U(0, 2π).
+                r = radius * math.sqrt(np.random.uniform(0.0, 1.0))
+                a = np.random.uniform(0.0, 2 * math.pi)
+                px = x + r * math.cos(a)
+                py = y + r * math.sin(a)
+
+                if rooms:
+                    if any(_point_in_polygon(px, py, room.polygon) for room in rooms):
+                        break
+                elif not self._inside_wall(px, py):
+                    break
+            idx = np.random.randint(n)
+            self.particles[idx] = [px, py, np.random.uniform(0, 2 * math.pi)]
 
     # -----------------------------------------------------------------------
     # Estimate

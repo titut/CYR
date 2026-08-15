@@ -50,6 +50,41 @@ def _footprint_clear(
     return True
 
 
+def _find_free_nearby(
+    grid: OccupancyGrid,
+    x: float,
+    y: float,
+    footprint: List[Tuple[int, int]],
+    search_radius: float = 1.25,
+) -> Optional[Tuple[float, float]]:
+    """Return a collision-free point near (x, y), or None if none exists.
+
+    If (x, y) is already free, returns it unchanged.  Otherwise searches the
+    cells within ``search_radius`` (meters) for the closest cell whose robot
+    footprint is free.  This keeps pose-estimation error from making A* reject
+    a slightly-in-collision start or goal outright.
+    """
+    gx, gy = grid.world_to_grid(x, y)
+    if _footprint_clear(grid, gx, gy, footprint):
+        return (x, y)
+
+    radius_cells = int(math.ceil(search_radius / grid.resolution))
+    best_d = float("inf")
+    best: Optional[Tuple[float, float]] = None
+    for dgx in range(-radius_cells, radius_cells + 1):
+        for dgy in range(-radius_cells, radius_cells + 1):
+            nx, ny = gx + dgx, gy + dgy
+            if not (0 <= nx < grid.cols and 0 <= ny < grid.rows):
+                continue
+            if _footprint_clear(grid, nx, ny, footprint):
+                wx, wy = grid.grid_to_world(nx, ny)
+                d = math.hypot(wx - x, wy - y)
+                if d < best_d:
+                    best_d = d
+                    best = (wx, wy)
+    return best
+
+
 def plan_path(
     grid: OccupancyGrid,
     start_world: Tuple[float, float],
@@ -64,21 +99,25 @@ def plan_path(
 
     Args:
         grid: The occupancy grid (walls = occupied cells).
-        start_world: Start position in world coordinates (pixels).
-        goal_world: Goal position in world coordinates (pixels).
+        start_world: Start position in world coordinates (meters).
+        goal_world: Goal position in world coordinates (meters).
         footprint: List of (dx, dy) grid-cell offsets for the robot body.
 
     Returns:
         Ordered list of (x, y) waypoints from start to goal, or an empty list
         if no path exists.
     """
-    sx, sy = grid.world_to_grid(*start_world)
-    gx, gy = grid.world_to_grid(*goal_world)
+    # Nudge slightly-in-collision endpoints (common with pose estimation error)
+    # to the nearest free point instead of failing immediately.
+    free_start = _find_free_nearby(grid, start_world[0], start_world[1], footprint)
+    if free_start is None:
+        return []
+    free_goal = _find_free_nearby(grid, goal_world[0], goal_world[1], footprint)
+    if free_goal is None:
+        return []
 
-    if not _footprint_clear(grid, sx, sy, footprint):
-        return []
-    if not _footprint_clear(grid, gx, gy, footprint):
-        return []
+    sx, sy = grid.world_to_grid(*free_start)
+    gx, gy = grid.world_to_grid(*free_goal)
 
     open_set: List[Tuple[float, int, int]] = []
     heapq.heappush(open_set, (_heuristic(sx, sy, gx, gy), sx, sy))
@@ -96,7 +135,7 @@ def plan_path(
                 cx, cy = came_from[(cx, cy)]
                 path_grid.append((cx, cy))
             path_grid.reverse()
-            return [grid.grid_to_world(px, py) for px, py in path_grid]
+            return [grid.grid_to_world(gx, gy) for gx, gy in path_grid]
 
         for dx, dy, cost in _NEIGHBOURS:
             nx, ny = cx + dx, cy + dy
