@@ -68,6 +68,15 @@ class ParticleFilter:
         forward_noise_m: float = 0.01,
         theta_noise_rad: float = 0.01,
         random_fraction: float = 0.05,
+        z_hit: float = 0.8,
+        z_short: float = 0.1,
+        z_max: float = 0.05,
+        z_rand: float = 0.05,
+        lambda_short: float = 2.0,
+        odom_scale_init_std: float = 0.1,
+        odom_scale_roughen_std: float = 0.01,
+        odom_scale_min: float = 0.5,
+        odom_scale_max: float = 1.5,
     ):
         self.map_data = map_data
         self.num_particles = num_particles
@@ -75,9 +84,26 @@ class ParticleFilter:
         self.max_range = max_range_m
         self.measurement_sigma = measurement_sigma_m
 
+        # Mixture weights for the range-finder beam model.  Must sum to 1.
+        self.z_hit = z_hit
+        self.z_short = z_short
+        self.z_max = z_max
+        self.z_rand = z_rand
+        self.lambda_short = lambda_short
+
         self.forward_noise_m = forward_noise_m
         self.theta_noise_rad = theta_noise_rad
         self.random_fraction = random_fraction
+
+        # Per-particle odometry forward-scale factor (wheel-radius calibration).
+        # Stored in column 3 of each particle; 1.0 == nominal.  Initialized with
+        # a spread, roughened a little on each resample, and clamped to a sane
+        # range.  Estimated online as the LIDAR measurements favour the scale
+        # that best predicts observed motion.
+        self.odom_scale_init_std = odom_scale_init_std
+        self.odom_scale_roughen_std = odom_scale_roughen_std
+        self.odom_scale_min = odom_scale_min
+        self.odom_scale_max = odom_scale_max
 
         # Radius of the local random-injection disc used after an anchor.
         self.local_inject_radius_m = 2.0
@@ -85,9 +111,13 @@ class ParticleFilter:
         # Beam angles relative to the particle's forward direction.
         self.beam_angles = np.linspace(-math.pi, math.pi, num_beams, endpoint=False)
 
-        self.particles = np.zeros((num_particles, 3), dtype=np.float64)
+        self.particles = np.zeros((num_particles, 4), dtype=np.float64)
         self.weights = np.ones(num_particles) / num_particles
         self.initialized = False
+
+    def _random_scale(self) -> float:
+        """Sample an initial odometry forward-scale factor for one particle."""
+        return float(np.random.normal(1.0, self.odom_scale_init_std))
 
     # -----------------------------------------------------------------------
     # Initialization
@@ -105,7 +135,12 @@ class ParticleFilter:
                     y = np.random.uniform(0, height)
                     if not self._inside_wall(x, y):
                         break
-                self.particles[i] = [x, y, np.random.uniform(0, 2 * math.pi)]
+                self.particles[i] = [
+                    x,
+                    y,
+                    np.random.uniform(0, 2 * math.pi),
+                    self._random_scale(),
+                ]
         else:
             areas = np.array([_polygon_area(r.polygon) for r in rooms])
             probs = areas / areas.sum()
@@ -122,7 +157,12 @@ class ParticleFilter:
                     y = np.random.uniform(min(ys), max(ys))
                     if _point_in_polygon(x, y, room.polygon):
                         break
-                self.particles[i] = [x, y, np.random.uniform(0, 2 * math.pi)]
+                self.particles[i] = [
+                    x,
+                    y,
+                    np.random.uniform(0, 2 * math.pi),
+                    self._random_scale(),
+                ]
 
         self.weights = np.ones(self.num_particles) / self.num_particles
         self.initialized = True
@@ -152,14 +192,14 @@ class ParticleFilter:
                 if rooms:
                     for room in rooms:
                         if _point_in_polygon(sx, sy, room.polygon):
-                            self.particles[i] = [sx, sy, pt]
+                            self.particles[i] = [sx, sy, pt, self._random_scale()]
                             break
                     else:
                         # Not inside any room — retry.
                         continue
                 else:
                     if not self._inside_wall(sx, sy):
-                        self.particles[i] = [sx, sy, pt]
+                        self.particles[i] = [sx, sy, pt, self._random_scale()]
                     else:
                         # Inside a wall — retry.
                         continue
@@ -202,19 +242,94 @@ class ParticleFilter:
                 if rooms:
                     for room in rooms:
                         if _point_in_polygon(sx, sy, room.polygon):
-                            self.particles[idx] = [sx, sy, pt]
+                            self.particles[idx] = [sx, sy, pt, self._random_scale()]
                             break
                     else:
                         continue
                 else:
                     if not self._inside_wall(sx, sy):
-                        self.particles[idx] = [sx, sy, pt]
+                        self.particles[idx] = [sx, sy, pt, self._random_scale()]
                     else:
                         continue
                 break
 
         # Re-normalize weights so injected particles get equal weight.
         self.weights = np.ones(n) / n
+
+    def fuse_absolute_pose(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        std_xy_m: float,
+        std_theta_rad: float,
+        delta_forward_m: float = 0.0,
+        delta_theta: float = 0.0,
+    ) -> bool:
+        """Fuse an absolute pose measurement (e.g. an AprilTag anchor).
+
+        Multiplies each particle's weight by the Gaussian likelihood of the
+        measurement given the particle's pose — a Bayesian update that preserves
+        the current belief instead of wiping it.
+
+        ``delta_forward_m``/``delta_theta`` are the motion between the
+        measurement's capture time and now.  Each particle is *back-propagated*
+        through the unicycle motion model (using its own odometry scale) to the
+        capture time before evaluating the likelihood, so a delayed measurement
+        is fused at the time it actually applies — correct time-travel — rather
+        than a raw forward-projection hack.
+
+        If the measurement is inconsistent with *every* particle (the filter is
+        lost), a fraction of particles is re-seeded around the measurement and
+        projected forward to now to recover.
+
+        Returns True if fused via weighting, False if a recovery re-seed was
+        needed.
+        """
+        if not self.initialized:
+            return False
+
+        # Back-propagate each particle to the capture time.  Zero deltas (an
+        # immediate measurement) leave the particles unchanged.
+        bp_theta = self.particles[:, 2] - delta_theta
+        forward = self.particles[:, 3] * delta_forward_m
+        bp_x = self.particles[:, 0] - forward * np.cos(self.particles[:, 2])
+        bp_y = self.particles[:, 1] - forward * np.sin(self.particles[:, 2])
+
+        dx = bp_x - x
+        dy = bp_y - y
+        dtheta = np.arctan2(np.sin(bp_theta - theta), np.cos(bp_theta - theta))
+
+        # Gaussian likelihood of each particle under the measurement.
+        lik = np.exp(
+            -0.5
+            * (
+                (dx * dx + dy * dy) / (std_xy_m * std_xy_m)
+                + (dtheta * dtheta) / (std_theta_rad * std_theta_rad)
+            )
+        )
+
+        total = float(np.sum(lik * self.weights))
+        if total > 1e-9:
+            # Consistent with the belief: importance-weight by the measurement.
+            new_w = lik * self.weights
+            self.weights = new_w / new_w.sum()
+            return True
+
+        # Inconsistent — the filter is lost.  Re-seed around the (past)
+        # measurement and project forward to now so the recovered belief is at
+        # the current time.
+        self.anchor_fraction(
+            x,
+            y,
+            theta,
+            std_xy_m=std_xy_m,
+            std_theta_rad=std_theta_rad,
+            fraction=0.5,
+        )
+        if delta_forward_m != 0.0 or delta_theta != 0.0:
+            self.predict(delta_forward_m, delta_theta)
+        return False
 
     def _inside_wall(self, x: float, y: float) -> bool:
         """Rough check whether a point is inside a wall buffer (not used with rooms)."""
@@ -233,7 +348,14 @@ class ParticleFilter:
     # -----------------------------------------------------------------------
 
     def predict(self, delta_forward_m: float, delta_theta: float):
-        """Advance particles by one odometry step with motion noise."""
+        """Advance particles by one odometry step with motion noise.
+
+        The heading change ``delta_theta`` is applied directly (expected to come
+        from the gyro / IMU, which does not suffer track-calibration error).
+        The forward translation is scaled by each particle's odometry
+        forward-scale factor (column 3), which is estimated online to absorb
+        wheel-radius error.
+        """
         if not self.initialized:
             return
 
@@ -245,9 +367,11 @@ class ParticleFilter:
         forward_noisy = delta_forward_m + np.random.normal(0.0, forward_std, n)
         theta_noisy = delta_theta + np.random.normal(0.0, theta_std, n)
 
+        scaled_forward = forward_noisy * self.particles[:, 3]
+
         self.particles[:, 2] += theta_noisy
-        self.particles[:, 0] += forward_noisy * np.cos(self.particles[:, 2])
-        self.particles[:, 1] += forward_noisy * np.sin(self.particles[:, 2])
+        self.particles[:, 0] += scaled_forward * np.cos(self.particles[:, 2])
+        self.particles[:, 1] += scaled_forward * np.sin(self.particles[:, 2])
 
     # -----------------------------------------------------------------------
     # Update
@@ -256,25 +380,66 @@ class ParticleFilter:
     def update(self, observed_hits: List[RayHit]):
         """Weight particles by how well each explains the observed LIDAR scan.
 
-        Implements the standard SIR (bootstrap) weight update:
+        Uses the standard four-component range-finder beam model (Thrun et al.,
+        "Probabilistic Robotics") instead of a single Gaussian:
+
+            p(z | x) = z_hit·p_hit + z_short·p_short + z_max·p_max + z_rand·p_rand
+
+        - p_hit   : Gaussian around the expected distance (a correct hit)
+        - p_short : exponential for unexpectedly *short* readings (a dynamic
+                    obstacle occluding the beam)
+        - p_max   : point mass at max range (sensor returns nothing)
+        - p_rand  : uniform over the range (random noise)
+
+        The uniform component keeps every beam's likelihood strictly above zero,
+        so a single unmodeled obstacle can no longer zero out the weight of the
+        correct particle.  Implements the standard SIR (bootstrap) weight update:
             new_weight ∝ p(measurement | particle) × old_weight
         """
         if not self.initialized:
             return
 
-        observed_distances = self._hits_to_distances(observed_hits)
-        expected = self._expected_distances()
+        observed = self._hits_to_distances(observed_hits)  # (num_beams,)
+        expected = self._expected_distances()  # (num_particles, num_beams)
 
-        # Gaussian beam likelihood with a relative floor.
-        diff = expected - observed_distances
-        raw_lik = np.exp(
-            -(diff * diff)
-            / (2.0 * self.measurement_sigma * self.measurement_sigma)
+        z = observed[None, :]  # broadcast to (num_particles, num_beams)
+        z_exp = expected
+        sigma = self.measurement_sigma
+        zmax = self.max_range
+
+        # ---- Hit component: Gaussian truncated to [0, zmax], normalized ----
+        cdf_hi = self._normal_cdf((zmax - z_exp) / sigma)
+        cdf_lo = self._normal_cdf((0.0 - z_exp) / sigma)
+        eta = 1.0 / np.maximum(cdf_hi - cdf_lo, 1e-12)
+        p_hit = eta * np.exp(-0.5 * ((z - z_exp) / sigma) ** 2) / (
+            sigma * math.sqrt(2.0 * math.pi)
         )
-        likelihoods = raw_lik + 0.001 * np.max(raw_lik, axis=1, keepdims=True)
 
-        # Multiply by previous weights (sequential importance sampling).
-        # Work in log space to avoid floating-point underflow.
+        # ---- Short component: exponential over [0, z_exp] ----
+        short_denom = 1.0 - np.exp(-self.lambda_short * z_exp)
+        eta_short = np.where(short_denom > 1e-9, 1.0 / short_denom, 0.0)
+        p_short = np.where(
+            (z <= z_exp) & (z_exp > 0.0),
+            eta_short * self.lambda_short * np.exp(-self.lambda_short * z),
+            0.0,
+        )
+
+        # ---- Max-range component: point mass at zmax ----
+        p_max = np.where(z >= zmax - 1e-9, 1.0, 0.0)
+
+        # ---- Random component: uniform over [0, zmax) ----
+        p_rand = np.where(z < zmax, 1.0 / zmax, 0.0)
+
+        likelihoods = (
+            self.z_hit * p_hit
+            + self.z_short * p_short
+            + self.z_max * p_max
+            + self.z_rand * p_rand
+        )
+        likelihoods = np.maximum(likelihoods, 1e-12)
+
+        # Multiply by previous weights (sequential importance sampling).  Work
+        # in log space to avoid floating-point underflow.
         log_likelihood = np.sum(np.log(likelihoods), axis=1)
         log_prior = np.log(np.maximum(self.weights, 1e-300))
         log_weights = log_prior + log_likelihood
@@ -284,6 +449,19 @@ class ParticleFilter:
             self.weights = weights / total
         else:
             self.weights = np.ones(self.num_particles) / self.num_particles
+
+    @staticmethod
+    def _normal_cdf(x: np.ndarray) -> np.ndarray:
+        """Standard normal CDF, vectorized without scipy.
+
+        Uses the Abramowitz & Stegun tanh approximation for erf(x), accurate to
+        ~1e-3, which is more than enough for a likelihood normalization
+        constant.
+        """
+        y = x / math.sqrt(2.0)
+        a = 2.0 / math.sqrt(math.pi)
+        b = 11.0 / 123.0
+        return 0.5 * (1.0 + np.tanh(a * (y + b * y**3)))
 
     def _expected_distances(self) -> np.ndarray:
         """Vectorized ray casting for all particles and beams."""
@@ -392,6 +570,11 @@ class ParticleFilter:
         self.particles[:, 0] += np.random.normal(0.0, 0.015, n)
         self.particles[:, 1] += np.random.normal(0.0, 0.015, n)
         self.particles[:, 2] += np.random.normal(0.0, 0.02, n)
+        # Keep a little diversity in the odometry scale estimate.
+        self.particles[:, 3] += np.random.normal(0.0, self.odom_scale_roughen_std, n)
+        self.particles[:, 3] = np.clip(
+            self.particles[:, 3], self.odom_scale_min, self.odom_scale_max
+        )
 
         # --- Random sample injection ---
         if self.random_fraction > 0:
@@ -416,7 +599,12 @@ class ParticleFilter:
                     if not self._inside_wall(x, y):
                         break
                 idx = np.random.randint(n)
-                self.particles[idx] = [x, y, np.random.uniform(0, 2 * math.pi)]
+                self.particles[idx] = [
+                    x,
+                    y,
+                    np.random.uniform(0, 2 * math.pi),
+                    self._random_scale(),
+                ]
             return
 
         areas = np.array([_polygon_area(r.polygon) for r in rooms])
@@ -432,7 +620,12 @@ class ParticleFilter:
                 if _point_in_polygon(x, y, room.polygon):
                     break
             idx = np.random.randint(n)
-            self.particles[idx] = [x, y, np.random.uniform(0, 2 * math.pi)]
+            self.particles[idx] = [
+                x,
+                y,
+                np.random.uniform(0, 2 * math.pi),
+                self._random_scale(),
+            ]
 
     def _inject_local(self, n_random: int, x: float, y: float):
         """Re-inject particles in a disc around (x, y) to preserve diversity.
@@ -457,20 +650,78 @@ class ParticleFilter:
                 elif not self._inside_wall(px, py):
                     break
             idx = np.random.randint(n)
-            self.particles[idx] = [px, py, np.random.uniform(0, 2 * math.pi)]
+            self.particles[idx] = [
+                px,
+                py,
+                np.random.uniform(0, 2 * math.pi),
+                self._random_scale(),
+            ]
 
     # -----------------------------------------------------------------------
     # Estimate
     # -----------------------------------------------------------------------
 
+    def _weighted_stats(self) -> Tuple[Tuple[float, float], float, np.ndarray]:
+        """Weighted mean and 3x3 covariance of the particle distribution.
+
+        Theta is handled circularly: the mean is the circular mean, and theta
+        deviations are wrapped to [-pi, pi] before computing the (linearized)
+        covariance — the standard treatment for a 2D pose.
+        """
+        w = self.weights
+        x = self.particles[:, 0]
+        y = self.particles[:, 1]
+        theta = self.particles[:, 2]
+
+        mx = float(np.average(x, weights=w))
+        my = float(np.average(y, weights=w))
+
+        sin_sum = float(np.sum(np.sin(theta) * w))
+        cos_sum = float(np.sum(np.cos(theta) * w))
+        mtheta = math.atan2(sin_sum, cos_sum)
+
+        dx = x - mx
+        dy = y - my
+        dtheta = np.arctan2(np.sin(theta - mtheta), np.cos(theta - mtheta))
+
+        cov = np.zeros((3, 3), dtype=np.float64)
+        cov[0, 0] = float(np.average(dx * dx, weights=w))
+        cov[1, 1] = float(np.average(dy * dy, weights=w))
+        cov[0, 1] = float(np.average(dx * dy, weights=w))
+        cov[1, 0] = cov[0, 1]
+        cov[0, 2] = float(np.average(dx * dtheta, weights=w))
+        cov[2, 0] = cov[0, 2]
+        cov[1, 2] = float(np.average(dy * dtheta, weights=w))
+        cov[2, 1] = cov[1, 2]
+        cov[2, 2] = float(np.average(dtheta * dtheta, weights=w))
+
+        return (mx, my), mtheta, cov
+
     def estimate(self) -> Tuple[float, float, float]:
         """Return the weighted mean pose estimate."""
-        x_mean = float(np.average(self.particles[:, 0], weights=self.weights))
-        y_mean = float(np.average(self.particles[:, 1], weights=self.weights))
+        (mx, my), mtheta, _ = self._weighted_stats()
+        return mx, my, mtheta
 
-        # Circular mean for theta.
-        sin_sum = float(np.sum(np.sin(self.particles[:, 2]) * self.weights))
-        cos_sum = float(np.sum(np.cos(self.particles[:, 2]) * self.weights))
-        theta_mean = math.atan2(sin_sum, cos_sum)
+    def covariance(self) -> np.ndarray:
+        """Return the 3x3 covariance matrix of the pose estimate.
 
-        return x_mean, y_mean, theta_mean
+        Ordering is (x, y, theta); units are meters and radians.
+        """
+        _, _, cov = self._weighted_stats()
+        return cov
+
+    def effective_sample_size(self) -> float:
+        """Return the effective sample size (1 / sum w_i^2).
+
+        Low ESS means the weights are degenerate, so resampling is needed to
+        avoid sample impoverishment.  Range is [1, num_particles].
+        """
+        return 1.0 / float(np.sum(self.weights * self.weights))
+
+    def odom_scale_estimate(self) -> float:
+        """Return the weighted-mean odometry forward-scale estimate.
+
+        This is the online wheel-radius calibration: it should converge toward
+        the true odometry scale error (e.g. wheel-slip bias).
+        """
+        return float(np.average(self.particles[:, 3], weights=self.weights))

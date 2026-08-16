@@ -91,12 +91,18 @@ class Obstacle:
     them to its occupancy grid up front.  Instead the robot detects them with
     its LIDAR (actual scan vs. expected wall-only scan) and routes around them.
     The simulator treats them as solid for both collision and ray casting.
+
+    An obstacle with a nonzero velocity (``vx_mps``/``vy_mps``) is a *moving*
+    obstacle: the simulator advances its position every frame and bounces it
+    off walls.  Static obstacles (zero velocity) never move.
     """
 
     id: int  # numeric obstacle ID
     x: float  # world x in meters
     y: float  # world y in meters
     radius_m: float = 0.2  # radius in meters
+    vx_mps: float = 0.0  # velocity (m/s); nonzero makes the obstacle move
+    vy_mps: float = 0.0
 
 
 @dataclass
@@ -153,6 +159,8 @@ class MapData:
                     "x": o.x,
                     "y": o.y,
                     "radius_m": o.radius_m,
+                    "vx_mps": o.vx_mps,
+                    "vy_mps": o.vy_mps,
                 }
                 for o in self.obstacles
             ],
@@ -211,6 +219,8 @@ class MapData:
                     x=float(o["x"]),
                     y=float(o["y"]),
                     radius_m=float(o.get("radius_m", 0.2)),
+                    vx_mps=float(o.get("vx_mps", 0.0)),
+                    vy_mps=float(o.get("vy_mps", 0.0)),
                 )
                 for o in data.get("obstacles", [])
             ],

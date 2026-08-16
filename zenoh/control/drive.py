@@ -2,12 +2,14 @@
 
 Simulates the robot's motor controller and wheel encoders.  Subscribes to
 unicycle velocity commands (cmd/velocity), converts them to differential wheel
-speeds, applies first-order motor dynamics and encoder noise, and publishes the
-measured wheel speeds (sensor/wheel_speed).
+speeds, applies a torque-limited first-order velocity-loop model (with encoder
+noise), and publishes the measured wheel speeds (sensor/wheel_speed).
 
-This node models the *hardware* only: the motor lag and encoder error.  Wheel
-slip is a wheel-ground interaction and is modelled in the simulator's physics,
-not here.
+This node models the *hardware* only: the velocity-loop response, its
+acceleration (torque) limit, and encoder error.  Velocity-loop PID itself lives
+in the motor driver firmware (see T-019 / the HAL); this node approximates that
+closed loop as a first-order system with an acceleration cap.  Wheel slip is a
+wheel-ground interaction and is modelled in the simulator's physics, not here.
 
 It also implements an emergency stop: it compares each LIDAR ray against the
 square footprint at that angle and halts the wheels when the clearance between
@@ -48,7 +50,8 @@ from simulation.kinematics import square_footprint_radius, unicycle_to_wheel
 # Motor + encoder simulation
 # ---------------------------------------------------------------------------
 
-_MOTOR_TIME_CONSTANT_S = 0.1  # first-order lag toward commanded wheel speed
+_MOTOR_TIME_CONSTANT_S = 0.1  # velocity-loop time constant toward the target
+_MAX_WHEEL_ACCEL_RPS2 = 20.0  # torque-limited max wheel acceleration (rad/s²)
 _ENCODER_NOISE_RPS = 0.05  # 1σ Gaussian noise on measured wheel speed
 _LOOP_HZ = 50
 _CMD_TIMEOUT_S = 0.5  # coast to zero if no command arrives for this long
@@ -57,6 +60,31 @@ _CMD_TIMEOUT_S = 0.5  # coast to zero if no command arrives for this long
 # its radial extent varies with ray angle; the e-stop triggers when the minimum
 # clearance between the body edge and a detected surface drops below this.
 _ESTOP_CLEARANCE_M = 0.05
+
+
+def _velocity_step(
+    current: float,
+    target: float,
+    dt: float,
+    time_constant_s: float = _MOTOR_TIME_CONSTANT_S,
+    max_accel_rps2: float = _MAX_WHEEL_ACCEL_RPS2,
+) -> float:
+    """Advance ``current`` toward ``target`` with first-order dynamics, capped
+    by a per-step acceleration limit.
+
+    This models a velocity-controlled driver (velocity-loop PID in firmware,
+    approximated as a first-order response) with a finite torque limit: large
+    step changes ramp linearly at ``max_accel_rps2``, while small changes decay
+    with ``time_constant_s``.
+    """
+    alpha = min(1.0, dt / time_constant_s)
+    step = alpha * (target - current)
+    max_step = max_accel_rps2 * dt
+    if step > max_step:
+        step = max_step
+    elif step < -max_step:
+        step = -max_step
+    return current + step
 
 
 class Drive:
@@ -152,10 +180,10 @@ class Drive:
 
         target_left, target_right = unicycle_to_wheel(linear, angular)
 
-        # First-order motor dynamics toward the commanded wheel speeds.
-        alpha = min(1.0, dt / _MOTOR_TIME_CONSTANT_S)
-        self._left_rps += alpha * (target_left - self._left_rps)
-        self._right_rps += alpha * (target_right - self._right_rps)
+        # Velocity loop: first-order response toward the target, capped by the
+        # torque/acceleration limit so step changes ramp instead of jumping.
+        self._left_rps = _velocity_step(self._left_rps, target_left, dt)
+        self._right_rps = _velocity_step(self._right_rps, target_right, dt)
 
         # Encoder measurement noise.
         left = self._left_rps + random.gauss(0.0, _ENCODER_NOISE_RPS)

@@ -1,4 +1,9 @@
-"""A* pathfinder on an OccupancyGrid with robot-footprint collision checking."""
+"""A* pathfinder on an OccupancyGrid with robot-footprint collision checking.
+
+Uses 8-connected grid expansion (with corner-cut prevention) and an octile
+heuristic, then smooths the resulting path with greedy line-of-sight
+shortcutting so it has no stair-step zigzags.
+"""
 
 from __future__ import annotations
 
@@ -23,18 +28,27 @@ import numpy as np
 from simulation.occupancy_grid import OccupancyGrid  # stays in simulation
 from navigation.footprint import make_footprint
 
-# 4-connected neighbour offsets: (dx, dy, cost)
+_DIAG_COST = math.sqrt(2.0)
+
+# 8-connected neighbour offsets: (dx, dy, cost).  Cardinal moves cost 1, diagonal
+# moves cost √2.
 _NEIGHBOURS = [
     (-1, 0, 1.0),  # W
     (1, 0, 1.0),  # E
     (0, -1, 1.0),  # N
     (0, 1, 1.0),  # S
+    (-1, -1, _DIAG_COST),  # NW
+    (1, -1, _DIAG_COST),  # NE
+    (-1, 1, _DIAG_COST),  # SW
+    (1, 1, _DIAG_COST),  # SE
 ]
 
 
 def _heuristic(ax: int, ay: int, bx: int, by: int) -> float:
-    """Manhattan distance for 4-connected grids."""
-    return float(abs(ax - bx) + abs(ay - by))
+    """Octile distance: admissible and consistent for 8-connected grids."""
+    dx = abs(ax - bx)
+    dy = abs(ay - by)
+    return max(dx, dy) + (_DIAG_COST - 1.0) * min(dx, dy)
 
 
 def _footprint_clear(
@@ -83,6 +97,72 @@ def _find_free_nearby(
                     best_d = d
                     best = (wx, wy)
     return best
+
+
+def _line_collision_free(
+    grid: OccupancyGrid,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    footprint: List[Tuple[int, int]],
+) -> bool:
+    """True if the straight world line (x1,y1)→(x2,y2) is collision-free.
+
+    Samples the segment at half the grid resolution and checks the full robot
+    footprint at each sample, so the swept corridor is respected.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = math.hypot(dx, dy)
+    if dist == 0:
+        gx, gy = grid.world_to_grid(x1, y1)
+        return _footprint_clear(grid, gx, gy, footprint)
+
+    step = grid.resolution / 2.0
+    steps = max(1, int(math.ceil(dist / step)))
+    for i in range(steps + 1):
+        t = i / steps
+        x = x1 + dx * t
+        y = y1 + dy * t
+        gx, gy = grid.world_to_grid(x, y)
+        if not _footprint_clear(grid, gx, gy, footprint):
+            return False
+    return True
+
+
+def _smooth_path(
+    grid: OccupancyGrid,
+    path_world: List[Tuple[float, float]],
+    footprint: List[Tuple[int, int]],
+) -> List[Tuple[float, float]]:
+    """Greedy line-of-sight shortcutting to remove stair-step zigzags.
+
+    From each waypoint, jump to the farthest later waypoint that is reachable
+    by a collision-free straight line.  Produces a shorter, smoother path with
+    no 90°-staircase artifacts.
+    """
+    if len(path_world) < 3:
+        return path_world
+
+    smoothed: List[Tuple[float, float]] = [path_world[0]]
+    i = 0
+    while i < len(path_world) - 1:
+        j = len(path_world) - 1
+        while j > i + 1:
+            if _line_collision_free(
+                grid,
+                path_world[i][0],
+                path_world[i][1],
+                path_world[j][0],
+                path_world[j][1],
+                footprint,
+            ):
+                break
+            j -= 1
+        smoothed.append(path_world[j])
+        i = j
+    return smoothed
 
 
 def plan_path(
@@ -135,7 +215,8 @@ def plan_path(
                 cx, cy = came_from[(cx, cy)]
                 path_grid.append((cx, cy))
             path_grid.reverse()
-            return [grid.grid_to_world(gx, gy) for gx, gy in path_grid]
+            path_world = [grid.grid_to_world(gx, gy) for gx, gy in path_grid]
+            return _smooth_path(grid, path_world, footprint)
 
         for dx, dy, cost in _NEIGHBOURS:
             nx, ny = cx + dx, cy + dy
@@ -143,6 +224,14 @@ def plan_path(
             # Full-footprint check: the entire robot body must fit.
             if not _footprint_clear(grid, nx, ny, footprint):
                 continue
+
+            # Don't cut corners on diagonal moves: the two cells the robot
+            # sweeps through must also be clear.
+            if dx != 0 and dy != 0:
+                if not _footprint_clear(grid, cx + dx, cy, footprint):
+                    continue
+                if not _footprint_clear(grid, cx, cy + dy, footprint):
+                    continue
 
             tentative_g = g_score[cy, cx] + cost
             if tentative_g < g_score[ny, nx]:

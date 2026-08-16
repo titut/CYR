@@ -76,6 +76,7 @@ CAMERA_FOV_RAD = math.radians(90)  # horizontal field of view
 CAMERA_MAX_RANGE_M = 5.0  # max detection distance
 CAMERA_RANGE_NOISE_M = 0.02  # 1σ Gaussian noise on range measurement
 CAMERA_BEARING_NOISE_RAD = math.radians(1.0)  # 1σ Gaussian noise on bearing
+CAMERA_YAW_NOISE_RAD = math.radians(2.0)  # 1σ Gaussian noise on tag yaw
 
 COLORS = {
     "bg": (245, 245, 245),
@@ -104,10 +105,24 @@ COLORS = {
 # here in the physics step (not in the drive node, which only models the motor
 # and encoder).  It corrupts the ground-truth motion relative to what the wheel
 # encoders report, so odometry (integrated encoder speeds) drifts from truth.
-_SLIP_BIAS_MIN = 0.80
-_SLIP_BIAS_MAX = 1.20
+# Wheel-ground errors: independent wheel-radius and track calibration errors,
+# plus a small cross-coupling (differential drives couple linear motion into
+# rotation) and per-step slip noise.  These corrupt ground truth relative to
+# what the wheel encoders report, so odometry drifts from truth.
+_WHEEL_SCALE_MIN = 0.80
+_WHEEL_SCALE_MAX = 1.20
+_TRACK_SCALE_MIN = 0.85
+_TRACK_SCALE_MAX = 1.15
 _SLIP_NOISE = 0.10
 _CROSS_COUPLING_RAD_PER_M = 0.1
+
+# IMU realism: a small per-run gyro bias plus per-sample Gaussian noise on the
+# reported angular rate, and Gaussian noise on the absolute yaw (a
+# magnetometer-like reference).  The gyro bias drifts heading slowly; the yaw
+# has noise but no drift.
+IMU_GYRO_BIAS_RPS = 0.005  # ± half-range of the per-run bias
+IMU_GYRO_NOISE_RPS = 0.01  # 1σ Gaussian noise on the gyro rate
+IMU_YAW_NOISE_RAD = 0.05  # 1σ Gaussian noise on the absolute yaw
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +214,10 @@ class Simulator:
         self.px_per_m = 1.0 / raw_map.metadata.scale_m_per_px
         self.map_data = raw_map
         self.bot_radius_m = BOT_RADIUS_M
+        # Physics collision radius: the square's circumradius, so the collision
+        # check conservatively bounds the body in any orientation.  (A half-side
+        # 0.5 m square's corners reach 0.707 m when rotated 45°.)
+        self._collision_radius_m = BOT_RADIUS_M * math.sqrt(2.0)
 
         # Bot state in meters and radians.
         start_center = (
@@ -226,8 +245,14 @@ class Simulator:
         # Cached LIDAR scan.
         self.lidar_hits: List[RayHit] = []
 
-        # Wheel slip simulation: random calibration bias per run.
-        self._slip_bias = random.uniform(_SLIP_BIAS_MIN, _SLIP_BIAS_MAX)
+        # Wheel slip simulation: independent wheel-radius and track calibration
+        # errors per run, so odometry drifts from truth in both distance and
+        # heading.
+        self._wheel_scale = random.uniform(_WHEEL_SCALE_MIN, _WHEEL_SCALE_MAX)
+        self._track_scale = random.uniform(_TRACK_SCALE_MIN, _TRACK_SCALE_MAX)
+
+        # IMU gyro bias per run.
+        self._gyro_bias = random.uniform(-IMU_GYRO_BIAS_RPS, IMU_GYRO_BIAS_RPS)
 
         # Measured wheel speeds from the drive node (rad/s).
         self._wheel_lock = threading.Lock()
@@ -359,13 +384,21 @@ class Simulator:
         self._pub_lidar.put(lidar_msg)
 
         # IMU.
+        noisy_yaw = math.atan2(
+            math.sin(self.bot_theta + random.gauss(0.0, IMU_YAW_NOISE_RAD)),
+            math.cos(self.bot_theta + random.gauss(0.0, IMU_YAW_NOISE_RAD)),
+        )
         imu_msg = json.dumps(
             {
                 "t": now,
-                "yaw_rad": self.bot_theta,
+                "yaw_rad": noisy_yaw,
                 "pitch_rad": 0.0,
                 "roll_rad": 0.0,
-                "angular_velocity_rps": self.angular_velocity,
+                "angular_velocity_rps": (
+                    self.angular_velocity
+                    + self._gyro_bias
+                    + random.gauss(0.0, IMU_GYRO_NOISE_RPS)
+                ),
                 "linear_acceleration_mps2": {"x": 0.0, "y": 0.0, "z": 0.0},
             }
         )
@@ -462,8 +495,8 @@ class Simulator:
             left_rps, right_rps = self._left_rps, self._right_rps
         linear, angular = wheel_to_unicycle(left_rps, right_rps)
 
-        actual_linear = linear * self._slip_bias
-        actual_angular = angular * self._slip_bias
+        actual_linear = linear * self._wheel_scale
+        actual_angular = angular * self._wheel_scale / self._track_scale
         actual_angular += actual_linear * _CROSS_COUPLING_RAD_PER_M
         actual_linear += random.gauss(0.0, _SLIP_NOISE * abs(actual_linear))
         actual_angular += random.gauss(0.0, _SLIP_NOISE * abs(actual_angular))
@@ -471,17 +504,21 @@ class Simulator:
         self.linear_velocity = actual_linear
         self.angular_velocity = actual_angular
 
+        # Advance moving obstacles (LIDAR, collision and rendering all read
+        # obstacle.x/y every frame, so moving them here is all that's needed).
+        self._update_obstacles(dt)
+
         new_theta = self.bot_theta + actual_angular * dt
         new_x = self.bot_x + actual_linear * math.cos(self.bot_theta) * dt
         new_y = self.bot_y + actual_linear * math.sin(self.bot_theta) * dt
 
         obstacles = self.map_data.obstacles
         if not bot_collides(
-            (new_x, self.bot_y), self.bot_radius_m, self.map_data.walls, obstacles
+            (new_x, self.bot_y), self._collision_radius_m, self.map_data.walls, obstacles
         ):
             self.bot_x = new_x
         if not bot_collides(
-            (self.bot_x, new_y), self.bot_radius_m, self.map_data.walls, obstacles
+            (self.bot_x, new_y), self._collision_radius_m, self.map_data.walls, obstacles
         ):
             self.bot_y = new_y
         self.bot_theta = new_theta
@@ -500,6 +537,63 @@ class Simulator:
         )
         self._publish_zenoh()
         self._detect_apriltags()
+
+    def _update_obstacles(self, dt: float):
+        """Advance moving obstacles and bounce them off walls.
+
+        Obstacles with zero velocity are left untouched (static).  A moving
+        obstacle's velocity is reflected about a wall's normal when it would
+        collide, and its centre is pushed back out of the wall so it never
+        tunnels through.
+        """
+        for o in self.map_data.obstacles:
+            if o.vx_mps == 0.0 and o.vy_mps == 0.0:
+                continue
+            o.x += o.vx_mps * dt
+            o.y += o.vy_mps * dt
+            for wall in self.map_data.walls:
+                self._bounce_obstacle(o, wall)
+
+    @staticmethod
+    def _bounce_obstacle(o: Obstacle, wall: Wall):
+        """Reflect ``o``'s velocity off ``wall`` if the two intersect."""
+        d = point_to_segment_distance(o.x, o.y, wall)
+        if d >= o.radius_m:
+            return
+
+        wx = wall.x2 - wall.x1
+        wy = wall.y2 - wall.y1
+        length_sq = wx * wx + wy * wy
+        if length_sq == 0:
+            cx, cy = wall.x1, wall.y1
+        else:
+            t = max(
+                0.0,
+                min(1.0, ((o.x - wall.x1) * wx + (o.y - wall.y1) * wy) / length_sq),
+            )
+            cx = wall.x1 + t * wx
+            cy = wall.y1 + t * wy
+
+        nx = o.x - cx
+        ny = o.y - cy
+        n_len = math.hypot(nx, ny)
+        if n_len < 1e-9:
+            # Centre is exactly on the segment; use the segment normal.
+            nx = -wy
+            ny = wx
+            n_len = math.hypot(nx, ny)
+        nx /= n_len
+        ny /= n_len
+
+        # Reflect the velocity component along the contact normal.
+        dot = o.vx_mps * nx + o.vy_mps * ny
+        if dot < 0.0:
+            o.vx_mps -= 2.0 * dot * nx
+            o.vy_mps -= 2.0 * dot * ny
+
+        # Push the centre out of the wall so it doesn't tunnel.
+        o.x = cx + nx * o.radius_m
+        o.y = cy + ny * o.radius_m
 
     # -----------------------------------------------------------------------
     # AprilTag detection
@@ -544,13 +638,14 @@ class Simulator:
                 math.sin(tag.yaw_rad - self.bot_theta),
                 math.cos(tag.yaw_rad - self.bot_theta),
             )
+            noisy_tag_yaw = tag_yaw_in_camera + random.gauss(0.0, CAMERA_YAW_NOISE_RAD)
 
             detections.append(
                 {
                     "id": tag.id,
                     "range_m": max(0.0, noisy_range_m),
                     "bearing_rad": noisy_bearing,
-                    "tag_yaw_rad": tag_yaw_in_camera,
+                    "tag_yaw_rad": noisy_tag_yaw,
                     "tag_size_m": tag.size_m,
                 }
             )
