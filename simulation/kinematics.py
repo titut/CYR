@@ -5,7 +5,7 @@ controller works in, and the differential wheel speeds (left/right rad/s) of a
 two-wheel robot, which the drive node works in.
 
 Geometry assumptions:
-    - Robot footprint is a 1 m square (``BOT_SIZE_M``), matching the simulator.
+    - Robot footprint is a 0.75 m square (``BOT_SIZE_M``), matching the simulator.
     - Wheels sit on the robot's left/right edge, flush with the footprint so no
       part of the wheel protrudes.  Wheel radius is ``WHEEL_RADIUS_M``.
     - The wheel track (distance between wheel centres) is therefore
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 
-BOT_SIZE_M = 1.0  # robot footprint width (m), matches simulator BOT_SIZE_M
+BOT_SIZE_M = 0.75  # robot footprint width (m), matches simulator BOT_SIZE_M
 BOT_RADIUS_M = BOT_SIZE_M / 2.0
 WHEEL_RADIUS_M = 0.12
 # Wheels are flush with the footprint, so their centres are inset by the wheel

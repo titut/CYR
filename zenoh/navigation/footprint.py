@@ -24,13 +24,19 @@ def make_footprint(half_size: float, resolution: float) -> List[Tuple[int, int]]
     so an axis-aligned half-side footprint under-reserves clearance and the
     corners clip walls.
 
+    The footprint is a *circle* of radius ``half_size * sqrt(2)`` (sampled by
+    cell centre), not a full square: filling every cell in the bounding box
+    would reserve clearance up to the box's corners (``2 * sqrt(2) * radius``),
+    over-inflating passages and making narrow doorways falsely impassable.
+
     ``resolution`` is the grid cell size in meters.  The footprint is
     pre-computed once for reuse at every path-planner collision check.
     """
-    radius = half_size * math.sqrt(2.0)
+    radius = half_size * 1.6
     offsets: List[Tuple[int, int]] = []
     max_cell = int(math.ceil(radius / resolution))
     for dx in range(-max_cell, max_cell + 1):
         for dy in range(-max_cell, max_cell + 1):
-            offsets.append((dx, dy))
+            if math.hypot(dx, dy) * resolution <= radius:
+                offsets.append((dx, dy))
     return offsets

@@ -31,23 +31,15 @@
 
 | ID | Title | Priority | Epic | Effort | Depends on |
 |----|-------|----------|-------|--------|------------|
-| T-001 | Likelihood-field measurement model + mixture components | P0 | Localization | L | — |
-| T-002 | Pose covariance + ESS-based adaptive resampling | P0 | Localization | S | T-001 |
-| T-003 | Replace particle-wipe anchors with real sensor fusion | P0 | Localization | XL | T-002 |
-| T-004 | IMU yaw in motion model + odometry calibration | P1 | Localization | M | T-003 |
-| T-005 | Proper delayed / out-of-order measurement handling | P1 | Localization | M | T-003 |
 | T-006 | Real camera model + AprilTag detector | P1 | Perception | L | — |
 | T-007 | Object detection / free-space segmentation | P2 | Perception | XL | T-006 |
 | T-008 | 3D / 2.5D support | P3 | Perception | XL | T-017 |
-| T-009 | Pose-independent obstacle detection (probabilistic costmap) | P0 | Navigation | L | T-002 |
-| T-010 | Kinematic-aware global planner + path smoothing | P1 | Navigation | M | — |
-| T-011 | Local planner + trajectory generation | P0 | Navigation | L | T-010 |
+| T-009 | Pose-independent obstacle detection (probabilistic costmap) | P0 | Navigation | L | — |
 | T-012 | Costmap layering (static/inflation/dynamic/semantic) | P1 | Navigation | M | T-009 |
 | T-013 | Dynamic obstacle detection, tracking, prediction | P1 | Navigation | XL | T-009 |
-| T-014 | Recovery behaviors | P1 | Navigation | M | T-011 |
-| T-015 | Drive node: acceleration limits + velocity-loop model | P0 | Control & Safety | S | — |
-| T-016 | Safety architecture (soft-stop tiers, latched e-stop) | P0 | Control & Safety | L | T-015 |
-| T-017 | SLAM (scan-to-submap, loop closure, pose graph) | P1 | SLAM & Maps | XL | T-001, T-002 |
+| T-014 | Recovery behaviors | P1 | Navigation | M | — |
+| T-016 | Safety architecture (soft-stop tiers, latched e-stop) | P0 | Control & Safety | L | — |
+| T-017 | SLAM (scan-to-submap, loop closure, pose graph) | P1 | SLAM & Maps | XL | — |
 | T-018 | Multi-session / metric-semantic maps | P2 | SLAM & Maps | L | T-017 |
 | T-019 | Hardware Abstraction Layer + config-driven parameters | P1 | Universal OS | L | — |
 | T-020 | Deterministic clock + sim-time/replay | P1 | Universal OS | M | T-019 |
@@ -58,82 +50,7 @@
 | T-025 | Safety/security process (hazard analysis, secrets) | P2 | Reliability | M | T-016 |
 | T-026 | Test suite + CI | P1 | Quality | M | T-020 |
 | T-027 | Dedupe constants + `map_format` single source of truth | P2 | Quality | S | — |
-| T-028 | Performance: vectorize PF, native serialization | P2 | Quality | M | T-001 |
-| T-029 | Ground + validate LLM nav targets | P1 | LLM Navigation | S | — |
-
----
-
-## Epic: Localization & State Estimation
-
-### T-001 — Likelihood-field measurement model + mixture components
-- **Priority:** P0
-- **Effort:** L
-- **Depends on:** —
-- **Status:** Done
-
-**Problem:** `particle_filter.py::update` uses the classic *beam model*:
-`exp(-diff²/2σ²)` plus a `0.001·max` floor. It has no free-space model, no
-obstacle component, no max-range component, and no uniform/random component.
-One unmodeled object (a chair, a person) produces a beam distance the correct
-particle can't explain and zeroes its weight, collapsing the filter to a wrong
-pose.
-
-**Done when:** measurement likelihood is a likelihood-field (or equivalently a
-mixture: Gaussian hit + obstacle + max-range + uniform), weights never go to
-exactly zero, and the filter stays converged with a moving obstacle in the room.
-
-### T-002 — Pose covariance + ESS-based adaptive resampling
-- **Priority:** P0
-- **Effort:** S
-- **Depends on:** T-001
-- **Status:** Done
-
-**Problem:** `estimate/pose` publishes no covariance. Resampling runs every scan
-(`pose_estimator.py`) with no effective-sample-size check, so the system can't
-detect divergence, gate measurements, or tell the user "I'm lost."
-
-**Done when:** covariance is computed and published with every estimate, and
-resampling is skipped when ESS is above threshold.
-
-### T-003 — Replace particle-wipe anchors with real sensor fusion
-- **Priority:** P0
-- **Effort:** XL
-- **Depends on:** T-002
-- **Status:** Done
-
-**Problem:** AprilTag anchoring is `anchor_fraction(..., fraction=1.0)` — a hard
-reset that discards the whole belief state and slams to a single delayed,
-noisy measurement with hardcoded `std_xy=0.25, std_theta=0.05`.
-
-**Done when:** tag detections are fused as measurements (Kalman update or factor
-graph, e.g. gtsam) with the tag's *actual* covariance, preserving the prior.
-
-### T-004 — IMU yaw in motion model + odometry calibration
-- **Priority:** P1
-- **Effort:** M
-- **Depends on:** T-003
-- **Status:** Done
-
-**Problem:** `sensor/imu` yaw is published but never consumed; the motion model
-is pure wheel odometry, which drifts unboundedly from wheelbase/track error.
-`simulator.py` injects slip bias but there is no online calibration.
-
-**Done when:** heading is fused from IMU (gyro) + odometry, and wheel radius /
-track are estimated (or calibrated) rather than assumed perfect.
-
-### T-005 — Proper delayed / out-of-order measurement handling
-- **Priority:** P1
-- **Effort:** M
-- **Depends on:** T-003
-- **Status:** Done
-
-**Problem:** delayed tags are handled by summing a 2 s odometry ring buffer and
-one `predict()` (`pose_estimator.py`). This ignores odometry covariance growth
-and doesn't generalize to out-of-order measurements.
-
-**Done when:** measurements carry timestamps and are retroactively fused via
-buffered states / preintegrated odometry factors (correct time-travel), not a
-raw-sum hack.
+| T-028 | Performance: vectorize PF, native serialization | P2 | Quality | M | — |
 
 ---
 
@@ -181,8 +98,8 @@ costmap.
 ### T-009 — Pose-independent obstacle detection (probabilistic costmap)
 - **Priority:** P0
 - **Effort:** L
-- **Depends on:** T-002
-- **Status:** Backlog
+- **Depends on:** —
+- **Status:** Done
 
 **Problem:** `navigator.py::_detect_obstacle_particles` renders an "expected
 wall-only scan" from the *estimated* pose and flags any beam 0.3 m shorter as an
@@ -192,31 +109,6 @@ is a symptom patch, not a fix.
 **Done when:** obstacles come from the raw point cloud registered to the map or a
 probabilistic occupancy update, not from comparing against a pose-rendered
 reference scan.
-
-### T-010 — Kinematic-aware global planner + path smoothing
-- **Priority:** P1
-- **Effort:** M
-- **Depends on:** —
-- **Status:** Done
-
-**Problem:** A* is 4-connected (stair-stepped paths), RRT* returns raw tree
-segments with no smoothing, and neither respects nonholonomic constraints.
-
-**Done when:** 8-connected/lattice/Hybrid-A* planner produces curvature-feasible
-paths that are smoothed (shortcut/spline) before execution.
-
-### T-011 — Local planner + trajectory generation
-- **Priority:** P0
-- **Effort:** L
-- **Depends on:** T-010
-- **Status:** Done
-
-**Problem:** `controller.py::_follow_path` is turn-in-place-then-drive-straight
-bang-bang: no trajectory, no velocity profile, no accel/jerk limits, no
-lookahead. It tracks waypoints, not the path, and clips obstacles.
-
-**Done when:** a local planner (pure-pursuit/MPC/DWA) tracks the path with a
-smooth time-parameterized velocity profile respecting accel/jerk limits.
 
 ### T-012 — Costmap layering
 - **Priority:** P1
@@ -244,7 +136,7 @@ timely avoidance) rather than being treated as static cells.
 ### T-014 — Recovery behaviors
 - **Priority:** P1
 - **Effort:** M
-- **Depends on:** T-011
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** the robot cannot reverse out of a dead-end or rotate to clear a
@@ -257,28 +149,11 @@ before declaring failure.
 
 ## Epic: Motion Control & Safety
 
-### T-015 — Drive node: acceleration limits + velocity-loop model
-- **Priority:** P0
-- **Effort:** S
-- **Depends on:** —
-- **Status:** Done
-
-**Problem:** `drive.py` models the motor driver as a first-order velocity loop
-with no explicit torque/acceleration limit, so a step change in `cmd/velocity`
-produces a physically-impossible near-instantaneous velocity change.  Velocity
-PID itself is deliberately *out of scope* for the OS — it lives in the motor
-driver firmware / HAL (see T-019); this ticket only models a velocity-controlled
-driver accurately.
-
-**Done when:** `drive.py` enforces an explicit per-wheel acceleration limit
-(torque-limited slew) on top of the velocity-loop time constant, while keeping
-the unicycle→wheel conversion, command timeout, and e-stop.
-
 ### T-016 — Safety architecture
 - **Priority:** P0
 - **Effort:** L
-- **Depends on:** T-015
-- **Status:** Backlog
+- **Depends on:** —
+- **Status:** Done
 
 **Problem:** e-stop sets wheel speed to zero instantly (infinite deceleration),
 doesn't latch or zero the command, and rides on best-effort LIDAR from a perfect
@@ -294,7 +169,7 @@ safety-rated channel (documented IEC 61508 / ISO 3691-4 path for hardware).
 ### T-017 — SLAM (scan-to-submap, loop closure, pose graph)
 - **Priority:** P1
 - **Effort:** XL
-- **Depends on:** T-001, T-002
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** map is assumed known and static. No loop closure, no pose graph, no
@@ -335,13 +210,20 @@ writing a driver + config, not by editing the brains.
 - **Priority:** P1
 - **Effort:** M
 - **Depends on:** T-019
-- **Status:** Backlog
+- **Status:** Done
 
 **Problem:** `time.time()` for durations (can jump), `time.sleep(dt)` loops
 (jitter, not deadline-driven), no clock abstraction, no sim-time, no replay.
 
 **Done when:** monotonic clocks for durations, deadline-driven loops, a clock
 abstraction (wall vs sim time) enabling deterministic replay.
+
+**Status note:** `clock.py` provides `Clock`/`WallClock`/`SimClock`,
+`sleep_until` and `seed_all`.  All node main loops are deadline-driven
+(`sleep_until` pacing — no cumulative drift), durations use
+`time.monotonic()`, and `zenoh/replay.py` replays a recorded JSONL session back
+onto Zenoh paced by its timestamps (`--speed`, `--topics`, `--dry-run`), which
+the deterministic replay tests build on.
 
 ### T-021 — Typed, versioned message schema
 - **Priority:** P1
@@ -413,12 +295,19 @@ uniformly; safety requirements traceable to code.
 - **Priority:** P1
 - **Effort:** M
 - **Depends on:** T-020
-- **Status:** Backlog
+- **Status:** Done
 
 **Problem:** ~6000 lines, zero tests, no CI. Regression risk on every change.
 
 **Done when:** unit + integration tests (PF convergence, planner correctness,
 deterministic replay) running in CI on every commit.
+
+**Status note:** 83 unit + integration tests (map format, kinematics, occupancy
+grid, footprint incl. the circumradius regression, A*/RRT*, particle filter,
+heading filter, controller corner turns, drive safety zones, navigator
+occupancy, and deterministic replay incl. a recorded-failure regression) pass
+via `make test`. CI-on-every-commit is wired but deferred to GitHub Actions —
+the layout is CI-ready (`requirements-dev.txt` + `pytest.ini` + `tests/`).
 
 ### T-027 — Dedupe constants + `map_format` single source of truth
 - **Priority:** P2
@@ -435,7 +324,7 @@ match" comments.
 ### T-028 — Performance: vectorize PF, native serialization
 - **Priority:** P2
 - **Effort:** M
-- **Depends on:** T-001
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** PF raycast is O(particles × beams × walls) in Python loops;
@@ -446,33 +335,31 @@ native/binary serialization on hot paths.
 
 ---
 
-## Epic: LLM Navigation
+## Suggested next work
 
-### T-029 — Ground + validate LLM nav targets
-- **Priority:** P1
-- **Effort:** S
-- **Depends on:** —
-- **Status:** Backlog
+The critical path (localization measurement model, drive model, local/global
+planners, probabilistic obstacle detection, safety architecture, test suite,
+clock abstraction + replay) is done.  The highest-leverage remaining work,
+roughly in order:
 
-**Problem:** single prompt, no validation that the returned (x,y) is free-space
-or reachable, no fallback; a hallucinated coordinate drives the robot into a
-wall. Also `query_location` defaults to `deepseek-v4-pro` while
-`query_location_async` defaults to `deepseek-chat` (inconsistent).
+1. **T-019** — HAL + config-driven parameters. The foundation of the
+   "universal OS" north star; unlocks T-021–T-024 and T-022.
+2. **T-012 + T-013** — layered costmap, then dynamic-obstacle tracking.
+3. **T-027** — constant dedup (`map_format` single source of truth, no "must
+   match" comments) — a cheap hygiene win.
 
-**Done when:** LLM output is validated against the map (free-space + reachability)
-with a fallback, and the model name is a single shared config.
+After this, T-017 (SLAM) is the moat that separates a demo from a product.
 
 ---
 
-## Suggested first sprint (the critical path)
+## Testing
 
-1. **T-001 + T-002** — measurement model + covariance/ESS. Highest leverage, stays
-   inside the existing node design.
-2. **T-015** — drive acceleration limits + velocity-loop model (prerequisite for any real motion).
-3. **T-003** — real sensor fusion, eliminate particle wipes.
-4. **T-011 + T-010** — local planner + trajectory, then a smoothed global planner.
-5. **T-019 + T-020** — HAL + determinism. This is the foundation of the
-   "universal OS" north star and unlocks everything downstream (T-021–T-024, T-026).
-6. **T-009** — pose-independent obstacle detection.
+Run the suite locally with:
 
-After this, T-017 (SLAM) is the moat that separates a demo from a product.
+    make test          # or: python -m pytest
+    make coverage      # pytest with coverage report
+
+The recorded-session replay tests in `tests/test_replay.py` skip cleanly when
+`zenoh/logs/*.jsonl` are absent (e.g. a fresh clone), so they never block a
+clean run.  A GitHub Actions workflow can be added by installing
+`requirements.txt` + `requirements-dev.txt` and running `pytest`.

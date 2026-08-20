@@ -11,6 +11,7 @@ python3 zenoh/control/controller.py &
 python3 zenoh/pose_estimation/pose_estimator.py home.json &
 python3 zenoh/navigation/navigator.py home.json &
 python3 zenoh/apriltag_detection/detector.py &
+python3 zenoh/logger.py &
 
 # 3. Wait indefinitely for the user to stop the script
 wait

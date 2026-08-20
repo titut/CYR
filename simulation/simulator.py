@@ -15,6 +15,7 @@ Controls:
     W / S - Move forward / backward in the direction the bot is facing.
     A / D - Turn left / right.
     1 / 2 / 3 - Switch tabs: Map | LIDAR | Guess.
+    R     - Send safety/reset to clear a latched drive e-stop.
     + / - - Zoom in / out (Map and Guess tabs).
     ESC   - Quit.
 
@@ -26,10 +27,12 @@ Zenoh topics:
         sensor/wasd          — {"w","a","s","d"} booleans, raw teleop key state
         nav/goal             — {x_m, y_m} user-clicked map target (meters)
         nav/command          — string, LLM text command from chat bar
+        safety/reset         — any payload: clears a latched drive e-stop (R key)
     Subscribed:
         estimate/pose        — external pose estimate {x_m, y_m, theta_rad, t}
         nav/path             — planned waypoints [[x, y], ...] (meters)
         sensor/wheel_speed   — measured wheel speeds {left_rps, right_rps, t}
+        detection/obstacles  — LIDAR-detected obstacle points (Guess tab)
 """
 
 from __future__ import annotations
@@ -99,6 +102,7 @@ COLORS = {
     "apriltag_detected": (255, 215, 0),
     "obstacle": (255, 100, 0),
     "obstacle_outline": (180, 60, 0),
+    "detected_obstacle": (230, 0, 100),
 }
 
 # Wheel slip simulation.  Slip is a wheel-ground interaction, so it is applied
@@ -113,7 +117,7 @@ _WHEEL_SCALE_MIN = 0.80
 _WHEEL_SCALE_MAX = 1.20
 _TRACK_SCALE_MIN = 0.85
 _TRACK_SCALE_MAX = 1.15
-_SLIP_NOISE = 0.10
+_SLIP_NOISE = 0.02
 _CROSS_COUPLING_RAD_PER_M = 0.1
 
 # IMU realism: a small per-run gyro bias plus per-sample Gaussian noise on the
@@ -216,7 +220,7 @@ class Simulator:
         self.bot_radius_m = BOT_RADIUS_M
         # Physics collision radius: the square's circumradius, so the collision
         # check conservatively bounds the body in any orientation.  (A half-side
-        # 0.5 m square's corners reach 0.707 m when rotated 45°.)
+        # 0.375 m square's corners reach 0.53 m when rotated 45°.)
         self._collision_radius_m = BOT_RADIUS_M * math.sqrt(2.0)
 
         # Bot state in meters and radians.
@@ -263,6 +267,10 @@ class Simulator:
         self.nav_target: Optional[Tuple[float, float]] = None
         self.nav_path: List[Tuple[float, float]] = []
 
+        # Obstacle points detected by the navigator (world frame, for display).
+        self._detected_obstacles: List[Tuple[float, float]] = []
+        self._detection_lock = threading.Lock()
+
         # Chat bar state.
         self._chat_active = False
         self._chat_text = ""
@@ -307,6 +315,13 @@ class Simulator:
             reliability=zenoh.Reliability.BEST_EFFORT,
         )
 
+        # Publisher: drive e-stop reset (pressed R, see T-016).
+        self._pub_safety_reset = self._zenoh_session.declare_publisher(
+            "safety/reset",
+            congestion_control=zenoh.CongestionControl.DROP,
+            reliability=zenoh.Reliability.BEST_EFFORT,
+        )
+
         # Subscribers.
         self._sub_pose = self._zenoh_session.declare_subscriber(
             "estimate/pose", self._on_estimate_pose
@@ -316,6 +331,9 @@ class Simulator:
         )
         self._sub_wheel = self._zenoh_session.declare_subscriber(
             "sensor/wheel_speed", self._on_wheel_speed
+        )
+        self._sub_detection = self._zenoh_session.declare_subscriber(
+            "detection/obstacles", self._on_detection
         )
 
     @staticmethod
@@ -352,6 +370,16 @@ class Simulator:
             logging.info("Received path with %d waypoints.", len(self.nav_path))
         except (json.JSONDecodeError, Exception) as exc:
             logging.warning("Failed to parse nav/path: %s", exc)
+
+    def _on_detection(self, sample):
+        """Receive obstacle points detected by the navigator (for display)."""
+        try:
+            data = json.loads(sample.payload.to_string())
+            points = [tuple(p) for p in data.get("points", [])]
+            with self._detection_lock:
+                self._detected_obstacles = points
+        except (json.JSONDecodeError, Exception) as exc:
+            logging.warning("Failed to parse detection/obstacles: %s", exc)
 
     def _on_wheel_speed(self, sample):
         """Receive measured wheel speeds from the drive node."""
@@ -448,6 +476,9 @@ class Simulator:
                 self.zoom = min(5.0, self.zoom * 1.1)
             elif event.key == pygame.K_MINUS:
                 self.zoom = max(0.2, self.zoom / 1.1)
+            elif event.key == pygame.K_r:
+                # Clear a latched drive e-stop (T-016).
+                self._pub_safety_reset.put("reset")
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1 and event.pos[1] <= TAB_BAR_HEIGHT:
                 tab_width = WINDOW_WIDTH // len(self.tabs)
@@ -725,7 +756,7 @@ class Simulator:
             f"Tab: {self.tabs[self.active_tab]}  (1/2/3 to switch)",
             f"Pose: x={self.bot_x:.1f}, y={self.bot_y:.1f}, θ={math.degrees(self.bot_theta):.1f}°",
             f"LIDAR rays: {len(self.lidar_hits)}",
-            "WASD to drive | +/- zoom | ESC quit",
+            "WASD to drive | R reset e-stop | +/- zoom | ESC quit",
         ]
         y = TAB_BAR_HEIGHT + 10
         for line in lines:
@@ -822,6 +853,18 @@ class Simulator:
             pygame.draw.circle(self.screen, COLORS["obstacle"], sc, max(1, int(radius)))
             pygame.draw.circle(
                 self.screen, COLORS["obstacle_outline"], sc, max(1, int(radius)), 2
+            )
+
+    def _draw_detected_obstacles(self, content_rect, camera, zoom):
+        """Draw the navigator's LIDAR-detected obstacle points."""
+        with self._detection_lock:
+            points = list(self._detected_obstacles)
+        radius = max(2, int(0.1 * self.px_per_m * zoom))
+        for px, py in points:
+            sc = self._world_to_screen((px, py), content_rect, camera, zoom)
+            pygame.draw.circle(self.screen, COLORS["detected_obstacle"], sc, radius)
+            pygame.draw.circle(
+                self.screen, (90, 0, 40), sc, radius, 1
             )
 
     def _draw_apriltags(self, content_rect, camera, zoom):
@@ -964,7 +1007,7 @@ class Simulator:
         self._draw_grid(content_rect, cam, self.zoom)
         self._draw_rooms(content_rect, cam, self.zoom)
         self._draw_walls(content_rect, cam, self.zoom)
-        self._draw_obstacles(content_rect, cam, self.zoom)
+        self._draw_detected_obstacles(content_rect, cam, self.zoom)
         self._draw_apriltags(content_rect, cam, self.zoom)
         self._draw_nav_target(content_rect, cam, self.zoom)
         self._draw_nav_path(content_rect, cam, self.zoom)

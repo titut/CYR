@@ -8,9 +8,10 @@ cmd/velocity.
 Path following uses *regulated pure pursuit*: a lookahead point is chosen ahead
 of the robot on the path, the commanded curvature is 2·e/L² (e = lateral offset
 of the lookahead point), and the linear speed is limited by centripetal
-acceleration and by distance to the goal.  The resulting velocity command is
-ramped through an accel/jerk-limited velocity profile, so it is smooth rather
-than bang-bang.
+acceleration and by distance to the goal.  At sharp corners the robot brakes
+and then rotates *in place* onto the next segment (pure pursuit's angular rate
+w = v·curvature would vanish at zero speed).  Bang-bang recovery takes over
+when the robot strays too far from the path.
 
 Teleop takes priority: while any WASD key is held the robot is driven by the
 keys and any in-progress path following is cancelled.
@@ -50,21 +51,23 @@ from simulation.kinematics import (
     BOT_ANGULAR_SPEED_RPS,
     BOT_LINEAR_SPEED_MPS,
 )
+from clock import sleep_until
 
 _LOOP_HZ = 50
 
 # --- Regulated pure pursuit ---
 
 # Lookahead distance (m): proportional to speed plus a floor, capped above.
-# The floor is kept small so the robot tracks tight corners closely (a large
-# minimum would make the pure-pursuit arc bulge wide and clip walls).
-LOOKAHEAD_MIN_M = 0.15
-LOOKAHEAD_GAIN_S = 0.35
-LOOKAHEAD_MAX_M = 2.0
+# Longer lookahead = lower curvature gain = less lateral overshoot / weaving.
+# Sharp corners are handled separately (SHARP_TURN_RAD / corner braking), so a
+# long lookahead doesn't make the robot cut corners.
+LOOKAHEAD_MIN_M = 0.2
+LOOKAHEAD_GAIN_S = 0.2
+LOOKAHEAD_MAX_M = 3.0
 
 # Distance (m) ahead over which to scan the path for sharp corners, so the robot
-# starts slowing down *before* a tight turn enters the (short) pure-pursuit
-# lookahead.  Must be at least the braking distance for the top speed.
+# starts slowing down *before* a tight turn enters the pure-pursuit lookahead.
+# Must be at least the braking distance for the top speed.
 CURVATURE_HORIZON_M = 4.0
 
 # A turn sharper than this angle (rad) is treated as a sharp corner: the pure
@@ -83,54 +86,67 @@ GOAL_RADIUS_M = 0.3  # declare arrival once the goal is this close
 
 # Deceleration used by the braking-distance speed limit (m/s²).  The robot's
 # speed is capped so it can always brake to a stop within the remaining distance
-# to the goal: v <= sqrt(2 * a * d_goal).  Kept below MAX_LIN_ACCEL_MPS2 to
-# leave margin for the jerk-limited velocity ramp (which can't apply full
-# deceleration instantly).
+# to the goal.  The drive node applies the actual deceleration (it owns the
+# low-level velocity loop).
 GOAL_BRAKE_DECEL_MPS2 = 1.0
 
-# Reaction time (s) added to the braking limit, covering the velocity-ramp lag,
-# the drive's velocity loop, and pose-estimate staleness.  During this time the
-# robot keeps moving at its current speed before deceleration takes effect, so
-# the speed limit must reserve that distance too.
-BRAKE_REACTION_S = 0.5
+# Reaction time (s) added to the braking limit, covering the drive's velocity
+# loop and pose-estimate staleness.  During this time the robot keeps moving at
+# its current speed before deceleration takes effect.
+BRAKE_REACTION_S = 0.7
 
 # Centripetal acceleration limit (m/s²): caps speed on curved paths so the robot
-# doesn't skid or tip.
-MAX_CENTRIPETAL_ACCEL_MPS2 = 0.8
+# doesn't skid or tip.  Lower = slower through turns = less overshoot.
+MAX_CENTRIPETAL_ACCEL_MPS2 = 0.6
 
-# --- Velocity profile (time-parameterized, accel/jerk limited) ---
-MAX_LIN_ACCEL_MPS2 = 1.2
-MAX_LIN_JERK_MPS3 = 4.0
-MAX_ANG_ACCEL_RPS2 = 4.0
-MAX_ANG_JERK_RPS3 = 12.0
+# --- Bang-bang recovery ---
+# When the robot is far off the path, pure pursuit is too gentle (it corrects
+# gradually and can weave).  Past this threshold we switch to a decisive
+# bang-bang controller: turn in place toward the path, then creep back onto it.
 
+# Lateral deviation from the path (m) that triggers bang-bang recovery.
+OFF_PATH_BANG_BANG_M = 0.1
+# Heading error (rad) below which bang-bang drives instead of rotating in place.
+BANG_TURN_DEADBAND_RAD = 0.3
+# Recovery is about getting back ON the path, not making progress, so the
+# forward speed is kept low.  Driving at top speed here is what sent the robot
+# barrelling into a wall instead of braking for a corner.
+BANG_RECOVERY_SPEED_MPS = 0.5
+# Max heading error (rad) at which bang-bang still drives forward while
+# correcting the heading.  An offset is usually caused by a small unaccounted
+# yaw, so we counter that yaw in motion — turning up to ~45° toward the next
+# target while creeping forward — rather than pivoting 90° back onto the path.
+# Only when pointed more than this far off does the robot rotate in place first.
+BANG_MAX_TURN_RAD = math.radians(45.0)
+# Proportional turn gain: angular velocity = TURN_GAIN * heading error, capped at
+# BOT_ANGULAR_SPEED_RPS.  Used for recovery turns so rotation is smooth
+# (proportional), not full-on/off.
+TURN_GAIN = 4.0
 
-def _velocity_ramp(
-    v: float,
-    a: float,
-    target: float,
-    max_accel: float,
-    max_jerk: float,
-    dt: float,
-) -> Tuple[float, float]:
-    """Advance (velocity, acceleration) one step toward ``target``.
+# --- In-place corner turning ---
+# Pure pursuit's angular rate is w = v·curvature, so it vanishes as the
+# corner-braking drops v to ~0 right where the robot needs to rotate.  Once the
+# robot is parked near a sharp-corner waypoint and moving slowly, it instead
+# rotates in place onto the outgoing segment (proportional heading control),
+# then resumes pure pursuit.
 
-    The desired acceleration is proportional to the velocity error (a first-order
-    velocity loop) and clamped to ``max_accel``; its rate of change is clamped to
-    ``max_jerk``.  The result is a smooth S-curve velocity profile bounded by both
-    accel and jerk limits.
-    """
-    a_des = (target - v) / 0.25  # ~0.25 s velocity-loop time constant
-    a_des = max(-max_accel, min(max_accel, a_des))
-    da = a_des - a
-    da = max(-max_jerk * dt, min(max_jerk * dt, da))
-    a = a + da
-    v_new = v + a * dt
-    # Snap to the target once essentially there, to avoid limit-cycle creep.
-    if abs(target - v_new) < 0.005 and abs(a) < 0.5:
-        v_new = target
-        a = 0.0
-    return v_new, a
+# Parked within this distance (m) of the corner waypoint before turning in place.
+CORNER_TURN_RADIUS_M = 0.4
+# Only rotate in place when moving this slowly (m/s); otherwise keep driving
+# through the corner-braking approach.
+CORNER_TURN_MAX_SPEED_MPS = 0.5
+# Max in-place rotation rate at a corner (rad/s).  Rotating at the robot's full
+# angular limit (~3 rad/s) overshoots the target heading badly once the pose
+# estimate and drive response lag, so the corner turn is deliberately slower.
+CORNER_TURN_MAX_RPS = 1.2
+# Estimated angular rate (rad/s) below which the corner rotation counts as
+# settled.  The turn is only released once the heading is inside the deadband
+# AND the rotation has actually stopped, so the robot does not drive off while
+# still swinging.
+CORNER_SETTLE_OMEGA_RPS = 0.5
+# Forward speed (m/s) right after leaving a corner turn, so the robot creeps
+# onto the outgoing segment instead of lurching forward while it settles.
+CORNER_RESUME_SPEED_MPS = 0.5
 
 
 def _angle_diff(a: float, b: float) -> float:
@@ -146,6 +162,94 @@ def _brake_speed_limit(d_eff: float, decel: float, reaction: float) -> float:
     """
     d = max(0.0, d_eff)
     return math.sqrt((decel * reaction) ** 2 + 2.0 * decel * d) - decel * reaction
+
+
+def corner_ahead(
+    path: List[Tuple[float, float]], seg_idx: int
+) -> Optional[Tuple[Tuple[float, float], float]]:
+    """Return (waypoint, outgoing heading) of the first sharp corner at or
+    ahead of the projection, or None if there is none.
+
+    Checks the corner at the *start* of the current segment (the robot has
+    just rolled over onto the outgoing segment) first, then any sharp corner
+    at the end of the current segment or further ahead.
+    """
+    if len(path) < 3:
+        return None
+
+    # Corner at the start of the current segment.
+    if seg_idx >= 1 and seg_idx + 1 < len(path):
+        x1, y1 = path[seg_idx - 1]
+        x2, y2 = path[seg_idx]
+        incoming = math.atan2(y2 - y1, x2 - x1)
+        nx1, ny1 = path[seg_idx]
+        nx2, ny2 = path[seg_idx + 1]
+        outgoing = math.atan2(ny2 - ny1, nx2 - nx1)
+        if abs(_angle_diff(outgoing, incoming)) > SHARP_TURN_RAD:
+            return path[seg_idx], outgoing
+
+    # Corner at the end of the current segment, or further ahead.
+    i = seg_idx
+    while i < len(path) - 2:
+        x1, y1 = path[i]
+        x2, y2 = path[i + 1]
+        incoming = math.atan2(y2 - y1, x2 - x1)
+        nx1, ny1 = path[i + 1]
+        nx2, ny2 = path[i + 2]
+        outgoing = math.atan2(ny2 - ny1, nx2 - nx1)
+        if abs(_angle_diff(outgoing, incoming)) > SHARP_TURN_RAD:
+            return path[i + 1], outgoing
+        i += 1
+    return None
+
+
+def near_sharp_corner(
+    path: List[Tuple[float, float]], seg_idx: int, x: float, y: float
+) -> bool:
+    """True if the robot is within ``CORNER_TURN_RADIUS_M`` of the next
+    sharp-corner waypoint (used to keep the speed low right after a turn)."""
+    corner = corner_ahead(path, seg_idx)
+    if corner is None:
+        return False
+    waypoint, _ = corner
+    return math.hypot(waypoint[0] - x, waypoint[1] - y) < CORNER_TURN_RADIUS_M
+
+
+def turn_at_corner(
+    path: List[Tuple[float, float]],
+    seg_idx: int,
+    x: float,
+    y: float,
+    theta: float,
+    est_omega: float,
+) -> Optional[Tuple[float, float]]:
+    """If the robot is parked at a sharp corner, return (0.0, w) to rotate
+    in place onto the outgoing segment; otherwise return None so pure
+    pursuit proceeds.
+
+    The rotation rate is capped at ``CORNER_TURN_MAX_RPS`` (rotating at the
+    robot's full angular limit overshoots once the pose estimate / drive
+    response lag).  It is only released when the heading is inside the
+    deadband *and* the estimated angular rate has settled, so the robot does
+    not drive off while still swinging.
+    """
+    corner = corner_ahead(path, seg_idx)
+    if corner is None:
+        return None
+    waypoint, out_heading = corner
+
+    if math.hypot(waypoint[0] - x, waypoint[1] - y) >= CORNER_TURN_RADIUS_M:
+        return None  # not parked at the corner yet
+
+    err = _angle_diff(out_heading, theta)
+    if abs(err) <= BANG_TURN_DEADBAND_RAD and abs(est_omega) <= CORNER_SETTLE_OMEGA_RPS:
+        return None  # aimed and settled -> resume pure pursuit
+
+    w = max(
+        -CORNER_TURN_MAX_RPS,
+        min(CORNER_TURN_MAX_RPS, TURN_GAIN * err),
+    )
+    return (0.0, w)
 
 
 class Controller:
@@ -169,11 +273,17 @@ class Controller:
         # Current path and progress along it.
         self._path: List[Tuple[float, float]] = []
 
-        # Velocity-profile state (accel/jerk-limited ramp), linear and angular.
-        self._lin_v = 0.0
-        self._lin_a = 0.0
-        self._ang_v = 0.0
-        self._ang_a = 0.0
+        # Estimated robot speed (m/s) and angular rate (rad/s), derived from
+        # consecutive pose updates and low-pass filtered.  Speed adapts the
+        # pure-pursuit lookahead; the angular rate is used to detect that an
+        # in-place corner turn has settled.  The controller does NOT ramp
+        # velocity — that is the drive's job.
+        self._est_speed = 0.0
+        self._est_omega = 0.0
+        self._last_pose_x = 0.0
+        self._last_pose_y = 0.0
+        self._last_pose_theta = 0.0
+        self._last_pose_time: Optional[float] = None
 
         # Latest teleop key state.
         self._keys = {"w": False, "a": False, "s": False, "d": False}
@@ -182,9 +292,7 @@ class Controller:
             "estimate/pose", self._on_pose
         )
         self._sub_path = self._session.declare_subscriber("nav/path", self._on_path)
-        self._sub_wasd = self._session.declare_subscriber(
-            "sensor/wasd", self._on_wasd
-        )
+        self._sub_wasd = self._session.declare_subscriber("sensor/wasd", self._on_wasd)
 
     # -------------------------------------------------------------------
     # Zenoh callbacks
@@ -200,6 +308,21 @@ class Controller:
             return
         with self._lock:
             self._est_x, self._est_y, self._est_theta = x, y, theta
+
+            # Estimate speed / angular rate from consecutive pose updates.
+            now = time.monotonic()
+            if self._last_pose_time is not None:
+                dt = now - self._last_pose_time
+                if 0.0 < dt < 0.5:
+                    measured = (
+                        math.hypot(x - self._last_pose_x, y - self._last_pose_y) / dt
+                    )
+                    self._est_speed = 0.85 * self._est_speed + 0.15 * measured
+                    measured_omega = _angle_diff(theta, self._last_pose_theta) / dt
+                    self._est_omega = 0.85 * self._est_omega + 0.15 * measured_omega
+            self._last_pose_x, self._last_pose_y = x, y
+            self._last_pose_theta = theta
+            self._last_pose_time = now
 
     def _on_path(self, sample):
         try:
@@ -222,6 +345,28 @@ class Controller:
                 "s": bool(data.get("s", False)),
                 "d": bool(data.get("d", False)),
             }
+
+    def _closest_path_distance(self, path, x: float, y: float) -> float:
+        """Perpendicular distance from (x, y) to the path polyline."""
+        best_d2 = float("inf")
+        for i in range(len(path) - 1):
+            x1, y1 = path[i]
+            x2, y2 = path[i + 1]
+            wx, wy = x2 - x1, y2 - y1
+            length_sq = wx * wx + wy * wy
+            t = (
+                0.0
+                if length_sq == 0
+                else max(0.0, min(1.0, ((x - x1) * wx + (y - y1) * wy) / length_sq))
+            )
+            px = x1 + t * wx
+            py = y1 + t * wy
+            d2 = (px - x) ** 2 + (py - y) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+        if len(path) == 1:
+            best_d2 = (path[0][0] - x) ** 2 + (path[0][1] - y) ** 2
+        return math.sqrt(max(0.0, best_d2))
 
     # -------------------------------------------------------------------
     # Control
@@ -375,6 +520,16 @@ class Controller:
         if t > 0.999 and seg_idx < len(path) - 2:
             seg_idx += 1
             t = 0.0
+
+        # At a sharp corner, w = v·curvature would be ~0 (v was braked to ~0),
+        # so rotate in place onto the next segment instead of creeping around it.
+        if current_speed < CORNER_TURN_MAX_SPEED_MPS:
+            corner_turn = turn_at_corner(
+                path, seg_idx, x, y, theta, self._est_omega
+            )
+            if corner_turn is not None:
+                return corner_turn
+
         lx, ly = self._lookahead_point(path, seg_idx, t, lookahead)
 
         dx = lx - x
@@ -395,9 +550,7 @@ class Controller:
         # (b) Slow down for a sharp corner detected ahead: brake to (near) zero
         # by the time the robot reaches the corner, so it turns in place there
         # rather than cutting it.
-        corner_dist, _ = self._first_corner_ahead(
-            path, seg_idx, t, CURVATURE_HORIZON_M
-        )
+        corner_dist, _ = self._first_corner_ahead(path, seg_idx, t, CURVATURE_HORIZON_M)
         if corner_dist is not None:
             v_des = min(
                 v_des,
@@ -417,6 +570,11 @@ class Controller:
             ),
         )
 
+        # (d) Right after an in-place corner turn, creep forward instead of
+        # lurching off at the corner-brake speed while the heading settles.
+        if near_sharp_corner(path, seg_idx, x, y):
+            v_des = min(v_des, CORNER_RESUME_SPEED_MPS)
+
         w_des = v_des * curvature
         # If the required turn rate exceeds the limit, scale the speed down so
         # the robot still follows the arc instead of cutting the corner.
@@ -427,6 +585,13 @@ class Controller:
         return v_des, w_des
 
     def _compute_command(self) -> Tuple[float, float]:
+        """Decide the desired velocity and publish it directly.
+
+        No velocity ramp here: the controller emits the *target* velocity, and
+        the low-level drive node applies the accel/decel limits (that is a
+        firmware concern, not a navigation one).  This removes a whole layer of
+        lag that caused weaving and sluggish stops.
+        """
         with self._lock:
             keys = dict(self._keys)
             x, y, theta = self._est_x, self._est_y, self._est_theta
@@ -438,20 +603,46 @@ class Controller:
             elif not self._path:
                 target_lin, target_ang = 0.0, 0.0
             else:
-                target_lin, target_ang = self._follow_path(x, y, theta, self._lin_v)
+                # Bang-bang recovery takes priority over pure pursuit: recover
+                # decisively when far off the path, otherwise follow smoothly.
+                if self._closest_path_distance(self._path, x, y) > OFF_PATH_BANG_BANG_M:
+                    target_lin, target_ang = self._recover_bang_bang(x, y, theta)
+                else:
+                    target_lin, target_ang = self._follow_path(
+                        x, y, theta, self._est_speed
+                    )
 
-        # Ramp the commanded velocity toward the target with accel/jerk limits,
-        # producing a smooth velocity profile.
-        dt = 1.0 / _LOOP_HZ
-        self._lin_v, self._lin_a = _velocity_ramp(
-            self._lin_v, self._lin_a, target_lin,
-            MAX_LIN_ACCEL_MPS2, MAX_LIN_JERK_MPS3, dt,
+        return target_lin, target_ang
+
+    # -------------------------------------------------------------------
+    # Bang-bang recovery
+    # -------------------------------------------------------------------
+
+    def _recover_bang_bang(
+        self, x: float, y: float, theta: float
+    ) -> Tuple[float, float]:
+        """Decisively get back on the path, using proportional heading control.
+
+        Used when the robot has drifted far off the path (where pure pursuit
+        corrects too gently).  An offset is caused by an unaccounted yaw error,
+        so recovery counters that yaw toward the *next target* (a lookahead
+        point on the path) while still moving forward — the turn is proportional
+        to the heading error and capped around 45°, not a 90° pivot back onto
+        the perpendicular.  Only when pointed more than that far off does it
+        rotate in place first.
+        """
+        path = self._path
+        seg_idx, t = self._closest_point_on_path(path, x, y)
+        lx, ly = self._lookahead_point(path, seg_idx, t, LOOKAHEAD_MIN_M)
+        target_heading = math.atan2(ly - y, lx - x)
+        err = _angle_diff(target_heading, theta)
+        angular = max(
+            -BOT_ANGULAR_SPEED_RPS,
+            min(BOT_ANGULAR_SPEED_RPS, TURN_GAIN * err),
         )
-        self._ang_v, self._ang_a = _velocity_ramp(
-            self._ang_v, self._ang_a, target_ang,
-            MAX_ANG_ACCEL_RPS2, MAX_ANG_JERK_RPS3, dt,
-        )
-        return self._lin_v, self._ang_v
+        if abs(err) > BANG_MAX_TURN_RAD:
+            return 0.0, angular  # way off heading: correct the yaw in place
+        return BANG_RECOVERY_SPEED_MPS, angular  # counter the yaw while driving on
 
     # -------------------------------------------------------------------
     # Main loop
@@ -459,14 +650,17 @@ class Controller:
 
     def run(self):
         print("[controller] Running. Press Ctrl+C to stop.")
-        dt = 1.0 / _LOOP_HZ
+        period = 1.0 / _LOOP_HZ
+        next_tick = time.monotonic()
         try:
             while True:
-                time.sleep(dt)
                 linear, angular = self._compute_command()
                 self._pub_cmd.put(
                     json.dumps({"linear_mps": linear, "angular_rps": angular})
                 )
+                # Deadline-driven pacing: no cumulative drift from sleep jitter.
+                next_tick += period
+                sleep_until(next_tick)
         except KeyboardInterrupt:
             print("[controller] Stopping…")
         finally:

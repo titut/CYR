@@ -350,7 +350,7 @@ class PoseEstimator:
             # weighting update that preserves the current belief).  Rate-limit
             # to 2 Hz so the same tag isn't re-fused every scan while it stays
             # in view.
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_anchor_time >= 0.5:
                 # Measurement covariance from the camera noise model and the
                 # detection geometry (distance to the tag).
@@ -434,7 +434,7 @@ class PoseEstimator:
         """Adaptive resampling, only when the weights have degenerated."""
         ess = self.pf.effective_sample_size()
         if ess < ESS_RESAMPLE_FRACTION * self.pf.num_particles:
-            if time.time() - self._last_anchor_time < ANCHOR_LOCAL_INJECT_S:
+            if time.monotonic() - self._last_anchor_time < ANCHOR_LOCAL_INJECT_S:
                 self.pf.resample(
                     inject_mode="local",
                     anchor=(self.estimated_x, self.estimated_y),
@@ -624,8 +624,8 @@ class PoseEstimator:
 
         # Warn (rate-limited) when localization has likely diverged.
         std_xy = math.sqrt(self._cov[0][0] + self._cov[1][1])
-        if std_xy > LOST_XY_STD_M and time.time() - self._last_lost_warn > 5.0:
-            self._last_lost_warn = time.time()
+        if std_xy > LOST_XY_STD_M and time.monotonic() - self._last_lost_warn > 5.0:
+            self._last_lost_warn = time.monotonic()
             print(
                 f"[pose_estimator] WARNING: localization uncertain "
                 f"(std_xy={std_xy:.2f} m)"
