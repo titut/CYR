@@ -28,7 +28,7 @@ Usage:
 
 from __future__ import annotations
 
-import json
+import logging
 import math
 import sys
 import threading
@@ -47,11 +47,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
-from simulation.kinematics import (
-    BOT_ANGULAR_SPEED_RPS,
-    BOT_LINEAR_SPEED_MPS,
-)
-from clock import sleep_until
+from core.clock import sleep_until
+from core.messages import SchemaError, decode, decode_path, encode
+from core.robot_config import get_robot_config
 
 _LOOP_HZ = 50
 
@@ -256,6 +254,11 @@ class Controller:
     def __init__(self):
         self._session = zenoh.open(zenoh.Config())
 
+        # Robot description (T-019): max speeds from robot.yaml.
+        cfg = get_robot_config()
+        self._max_linear_mps = cfg.chassis.linear_speed_mps
+        self._max_angular_rps = cfg.chassis.angular_speed_rps
+
         self._pub_cmd = self._session.declare_publisher(
             "cmd/velocity",
             congestion_control=zenoh.CongestionControl.DROP,
@@ -300,11 +303,12 @@ class Controller:
 
     def _on_pose(self, sample):
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("estimate/pose", sample)
             x = float(data["x_m"])
             y = float(data["y_m"])
             theta = float(data["theta_rad"])
-        except (json.JSONDecodeError, KeyError, Exception):
+        except SchemaError as exc:
+            logging.warning("estimate/pose dropped: %s", exc)
             return
         with self._lock:
             self._est_x, self._est_y, self._est_theta = x, y, theta
@@ -326,17 +330,19 @@ class Controller:
 
     def _on_path(self, sample):
         try:
-            waypoints = json.loads(sample.payload.to_string())
+            waypoints = decode_path("nav/path", sample)
             path = [tuple(p) for p in waypoints]
-        except (json.JSONDecodeError, Exception):
+        except SchemaError as exc:
+            logging.warning("nav/path dropped: %s", exc)
             return
         with self._lock:
             self._path = path
 
     def _on_wasd(self, sample):
         try:
-            data = json.loads(sample.payload.to_string())
-        except (json.JSONDecodeError, Exception):
+            data = decode("sensor/wasd", sample)
+        except SchemaError as exc:
+            logging.warning("sensor/wasd dropped: %s", exc)
             return
         with self._lock:
             self._keys = {
@@ -372,18 +378,17 @@ class Controller:
     # Control
     # -------------------------------------------------------------------
 
-    @staticmethod
-    def _wasd_to_velocity(keys: dict) -> Tuple[float, float]:
+    def _wasd_to_velocity(self, keys: dict) -> Tuple[float, float]:
         linear = 0.0
         if keys.get("w"):
-            linear += BOT_LINEAR_SPEED_MPS
+            linear += self._max_linear_mps
         if keys.get("s"):
-            linear -= BOT_LINEAR_SPEED_MPS
+            linear -= self._max_linear_mps
         angular = 0.0
         if keys.get("a"):
-            angular -= BOT_ANGULAR_SPEED_RPS
+            angular -= self._max_angular_rps
         if keys.get("d"):
-            angular += BOT_ANGULAR_SPEED_RPS
+            angular += self._max_angular_rps
         return linear, angular
 
     def _closest_point_on_path(
@@ -543,7 +548,7 @@ class Controller:
         curvature = 2.0 * e_lat / (dist * dist)
 
         # (a) Desired speed: capped by centripetal acceleration on the arc.
-        v_des = BOT_LINEAR_SPEED_MPS
+        v_des = self._max_linear_mps
         if abs(curvature) > 1e-6:
             v_des = min(v_des, math.sqrt(MAX_CENTRIPETAL_ACCEL_MPS2 / abs(curvature)))
 
@@ -578,9 +583,9 @@ class Controller:
         w_des = v_des * curvature
         # If the required turn rate exceeds the limit, scale the speed down so
         # the robot still follows the arc instead of cutting the corner.
-        if abs(w_des) > BOT_ANGULAR_SPEED_RPS:
-            v_des = BOT_ANGULAR_SPEED_RPS / abs(curvature)
-            w_des = math.copysign(BOT_ANGULAR_SPEED_RPS, w_des)
+        if abs(w_des) > self._max_angular_rps:
+            v_des = self._max_angular_rps / abs(curvature)
+            w_des = math.copysign(self._max_angular_rps, w_des)
 
         return v_des, w_des
 
@@ -637,8 +642,8 @@ class Controller:
         target_heading = math.atan2(ly - y, lx - x)
         err = _angle_diff(target_heading, theta)
         angular = max(
-            -BOT_ANGULAR_SPEED_RPS,
-            min(BOT_ANGULAR_SPEED_RPS, TURN_GAIN * err),
+            -self._max_angular_rps,
+            min(self._max_angular_rps, TURN_GAIN * err),
         )
         if abs(err) > BANG_MAX_TURN_RAD:
             return 0.0, angular  # way off heading: correct the yaw in place
@@ -656,7 +661,7 @@ class Controller:
             while True:
                 linear, angular = self._compute_command()
                 self._pub_cmd.put(
-                    json.dumps({"linear_mps": linear, "angular_rps": angular})
+                    encode("cmd/velocity", {"linear_mps": linear, "angular_rps": angular})
                 )
                 # Deadline-driven pacing: no cumulative drift from sleep jitter.
                 next_tick += period

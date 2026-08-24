@@ -39,8 +39,7 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import random
+import logging
 import sys
 import threading
 import time
@@ -57,23 +56,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
-from simulation.kinematics import (
-    BOT_LINEAR_SPEED_MPS,
-    square_footprint_radius,
-    unicycle_to_wheel,
-)
-from clock import sleep_until
-
-# ---------------------------------------------------------------------------
-# Motor + encoder simulation
-# ---------------------------------------------------------------------------
-
-_MOTOR_TIME_CONSTANT_S = 0.05  # velocity-loop time constant toward the target
-_MAX_WHEEL_ACCEL_RPS2 = 35.0  # torque-limited max wheel acceleration (rad/s²)
-_MAX_WHEEL_DECEL_RPS2 = 70.0  # harder wheel deceleration, for crisp stops
-_ENCODER_NOISE_RPS = 0.05  # 1σ Gaussian noise on measured wheel speed
-_LOOP_HZ = 50
-_CMD_TIMEOUT_S = 0.5  # coast to zero if no command arrives for this long
+from core.clock import sleep_until
+from core.constants import BOT_LINEAR_SPEED_MPS
+from core.hal import load_drive_driver
+from core.messages import SchemaError, decode, decode_text, encode
+from core.robot_config import default_robot_config, get_robot_config
+from simulation.kinematics import square_footprint_radius
 
 # ---------------------------------------------------------------------------
 # Safety zones (T-016)
@@ -84,42 +72,34 @@ _CMD_TIMEOUT_S = 0.5  # coast to zero if no command arrives for this long
 #   slow_down (< _SLOW_DOWN_CLEARANCE_M)  linear speed scaled down with distance
 #   stop      (< _STOP_CLEARANCE_M)       forward motion halted (slow reverse ok)
 #   e-stop    (< _ESTOP_CLEARANCE_M)      latched: wheels at zero until reset
-_SLOW_DOWN_CLEARANCE_M = 1.0
-_STOP_CLEARANCE_M = 0.15
-_ESTOP_CLEARANCE_M = 0.05
+# The module-level values are the *default* (nominal) robot; at runtime the node
+# reads its zones from the loaded robot config.
+_DEF = default_robot_config()
+
+_SLOW_DOWN_CLEARANCE_M = _DEF.safety.slow_down_clearance_m
+_STOP_CLEARANCE_M = _DEF.safety.stop_clearance_m
+_ESTOP_CLEARANCE_M = _DEF.safety.estop_clearance_m
 # Slow reverse (m/s) allowed inside the stop zone so the robot can back away.
-_REVERSE_ESCAPE_MPS = 0.5
-
-
-def _velocity_step(
-    current: float,
-    target: float,
-    dt: float,
-    time_constant_s: float = _MOTOR_TIME_CONSTANT_S,
-    max_accel_rps2: float = _MAX_WHEEL_ACCEL_RPS2,
-    max_decel_rps2: float = _MAX_WHEEL_DECEL_RPS2,
-) -> float:
-    """Advance ``current`` toward ``target`` with first-order dynamics, capped
-    by per-step acceleration/deceleration limits.
-
-    This models a velocity-controlled driver (velocity-loop PID in firmware,
-    approximated as a first-order response) with a finite torque limit: large
-    step changes ramp linearly at ``max_accel_rps2`` (and brake at
-    ``max_decel_rps2``, which is higher so stops are crisp), while small changes
-    decay with ``time_constant_s``.
-    """
-    alpha = min(1.0, dt / time_constant_s)
-    step = alpha * (target - current)
-    if step > max_accel_rps2 * dt:
-        step = max_accel_rps2 * dt
-    elif step < -max_decel_rps2 * dt:
-        step = -max_decel_rps2 * dt
-    return current + step
+_REVERSE_ESCAPE_MPS = _DEF.safety.reverse_escape_mps
 
 
 class Drive:
     def __init__(self):
         self._session = zenoh.open(zenoh.Config())
+
+        # Robot config (T-019): safety zones + chassis geometry come from
+        # robot.yaml, and the motor plant is behind a driver selected by
+        # hardware.drive.driver (sim / logging / ...).
+        cfg = get_robot_config()
+        self._loop_hz = cfg.drive.loop_hz
+        self._cmd_timeout_s = cfg.drive.command_timeout_s
+        self._slow_down_clearance_m = cfg.safety.slow_down_clearance_m
+        self._stop_clearance_m = cfg.safety.stop_clearance_m
+        self._estop_clearance_m = cfg.safety.estop_clearance_m
+        self._reverse_escape_mps = cfg.safety.reverse_escape_mps
+        self._max_speed_mps = cfg.chassis.linear_speed_mps
+        self._bot_radius_m = cfg.chassis.radius_m
+        self._driver = load_drive_driver(cfg)
 
         self._pub_wheel = self._session.declare_publisher(
             "sensor/wheel_speed",
@@ -146,10 +126,6 @@ class Drive:
         # Last published safety state, so safety/status is only sent on change.
         self._last_status_state = ""
 
-        # Simulated actual wheel speeds (rad/s), starting at rest.
-        self._left_rps = 0.0
-        self._right_rps = 0.0
-
         self._sub_cmd = self._session.declare_subscriber(
             "cmd/velocity", self._on_cmd
         )
@@ -163,10 +139,11 @@ class Drive:
     def _on_cmd(self, sample):
         """Store the latest velocity command."""
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("cmd/velocity", sample)
             linear = float(data["linear_mps"])
             angular = float(data["angular_rps"])
-        except (json.JSONDecodeError, KeyError, Exception):
+        except SchemaError as exc:
+            logging.warning("cmd/velocity dropped: %s", exc)
             return
         with self._lock:
             self._cmd_linear = linear
@@ -176,16 +153,19 @@ class Drive:
     def _on_lidar(self, sample):
         """Store the minimum body-to-surface clearance of the latest scan."""
         try:
-            scan = json.loads(sample.payload.to_string())
+            scan = decode("sensor/lidar", sample)
             min_clearance = min(
                 (
                     float(entry["distance_m"])
-                    - square_footprint_radius(float(entry["angle_rad"]))
+                    - square_footprint_radius(
+                        float(entry["angle_rad"]), bot_radius_m=self._bot_radius_m
+                    )
                     for entry in scan.get("rays", [])
                 ),
                 default=float("inf"),
             )
-        except (json.JSONDecodeError, KeyError, Exception):
+        except SchemaError as exc:
+            logging.warning("sensor/lidar dropped: %s", exc)
             return
         with self._lock:
             self._min_clearance_m = min_clearance
@@ -193,6 +173,11 @@ class Drive:
     def _on_reset(self, sample):
         """Clear a latched e-stop.  The command is zeroed so the robot does not
         lurch back onto the command that caused the stop."""
+        try:
+            decode_text("safety/reset", sample)
+        except SchemaError as exc:
+            logging.warning("safety/reset dropped: %s", exc)
+            return
         with self._lock:
             if self._estop_latched:
                 self._estop_latched = False
@@ -201,26 +186,34 @@ class Drive:
             self._cmd_angular = 0.0
 
     @staticmethod
-    def _safety_limited_linear(linear: float, clearance: float) -> float:
+    def _safety_limited_linear(
+        linear: float,
+        clearance: float,
+        slow_down_clearance_m: float = _SLOW_DOWN_CLEARANCE_M,
+        stop_clearance_m: float = _STOP_CLEARANCE_M,
+        max_speed_mps: float = BOT_LINEAR_SPEED_MPS,
+        reverse_escape_mps: float = _REVERSE_ESCAPE_MPS,
+    ) -> float:
         """Cap the commanded linear speed by proximity to a surface.
 
         Above the slow-down zone the command passes through.  Inside it the
         speed is scaled linearly down to zero at the stop boundary, and inside
         the stop zone forward motion is halted while a slow reverse is allowed
-        so the robot can back away.
+        so the robot can back away.  Zone boundaries come from the robot config
+        (defaults = nominal robot).
         """
-        if clearance >= _SLOW_DOWN_CLEARANCE_M:
+        if clearance >= slow_down_clearance_m:
             return linear
-        if clearance > _STOP_CLEARANCE_M:
+        if clearance > stop_clearance_m:
             limit = (
-                BOT_LINEAR_SPEED_MPS
-                * (clearance - _STOP_CLEARANCE_M)
-                / (_SLOW_DOWN_CLEARANCE_M - _STOP_CLEARANCE_M)
+                max_speed_mps
+                * (clearance - stop_clearance_m)
+                / (slow_down_clearance_m - stop_clearance_m)
             )
             return max(-limit, min(limit, linear))
         # stop zone
         if linear < 0:
-            return max(linear, -_REVERSE_ESCAPE_MPS)
+            return max(linear, -reverse_escape_mps)
         return 0.0
 
     def _publish_status(self, state: str):
@@ -228,21 +221,22 @@ class Drive:
         if state != self._last_status_state:
             self._last_status_state = state
             self._pub_status.put(
-                json.dumps(
+                encode(
+                    "safety/status",
                     {
                         "state": state,
                         "min_clearance_m": round(self._min_clearance_m, 3),
                         "t": time.time(),
-                    }
+                    },
                 )
             )
 
     def _step(self, dt: float):
-        """Advance the motor simulation one step and publish the encoders."""
+        """Apply safety, command the driver, and publish the encoders."""
         with self._lock:
             linear = self._cmd_linear
             angular = self._cmd_angular
-            if time.monotonic() - self._last_cmd_time > _CMD_TIMEOUT_S:
+            if time.monotonic() - self._last_cmd_time > self._cmd_timeout_s:
                 linear = 0.0
                 angular = 0.0
             min_clearance_m = self._min_clearance_m
@@ -250,49 +244,61 @@ class Drive:
         # Latched e-stop: wheels stay at zero and commands are ignored until an
         # explicit safety/reset.  This is the safety function's safe state.
         if self._estop_latched:
-            self._left_rps = 0.0
-            self._right_rps = 0.0
+            self._driver.set_command(0.0, 0.0)
+            self._driver.step(dt)  # keep the (simulated) plant at rest
             self._pub_wheel.put(
-                json.dumps({"left_rps": 0.0, "right_rps": 0.0, "t": time.time()})
+                encode(
+                    "sensor/wheel_speed",
+                    {"left_rps": 0.0, "right_rps": 0.0, "t": time.time()},
+                )
             )
             self._publish_status("estop_latched")
             return
 
         # Body edge inside the e-stop threshold: latch it.
-        if min_clearance_m < _ESTOP_CLEARANCE_M:
+        if min_clearance_m < self._estop_clearance_m:
             with self._lock:
                 self._estop_latched = True
             print(
                 f"[drive] E-STOP LATCHED: clearance {min_clearance_m:.3f} m "
-                f"(< {_ESTOP_CLEARANCE_M} m). Send safety/reset to clear."
+                f"(< {self._estop_clearance_m} m). Send safety/reset to clear."
             )
-            self._left_rps = 0.0
-            self._right_rps = 0.0
+            self._driver.set_command(0.0, 0.0)
+            self._driver.step(dt)
             self._pub_wheel.put(
-                json.dumps({"left_rps": 0.0, "right_rps": 0.0, "t": time.time()})
+                encode(
+                    "sensor/wheel_speed",
+                    {"left_rps": 0.0, "right_rps": 0.0, "t": time.time()},
+                )
             )
             self._publish_status("estop_latched")
             return
 
         # Slow-down / stop zones: scale the linear command by proximity.
-        linear = self._safety_limited_linear(linear, min_clearance_m)
+        linear = self._safety_limited_linear(
+            linear,
+            min_clearance_m,
+            slow_down_clearance_m=self._slow_down_clearance_m,
+            stop_clearance_m=self._stop_clearance_m,
+            max_speed_mps=self._max_speed_mps,
+            reverse_escape_mps=self._reverse_escape_mps,
+        )
 
-        target_left, target_right = unicycle_to_wheel(linear, angular)
+        # Command the configured drive driver (sim/logging/...) and read the
+        # measured wheel speeds back.
+        self._driver.set_command(linear, angular)
+        left, right = self._driver.step(dt)
 
-        # Velocity loop: first-order response toward the target, capped by the
-        # torque/acceleration limit so step changes ramp instead of jumping.
-        self._left_rps = _velocity_step(self._left_rps, target_left, dt)
-        self._right_rps = _velocity_step(self._right_rps, target_right, dt)
+        self._pub_wheel.put(
+            encode(
+                "sensor/wheel_speed",
+                {"left_rps": left, "right_rps": right, "t": time.time()},
+            )
+        )
 
-        # Encoder measurement noise.
-        left = self._left_rps + random.gauss(0.0, _ENCODER_NOISE_RPS)
-        right = self._right_rps + random.gauss(0.0, _ENCODER_NOISE_RPS)
-
-        self._pub_wheel.put(json.dumps({"left_rps": left, "right_rps": right, "t": time.time()}))
-
-        if min_clearance_m < _STOP_CLEARANCE_M:
+        if min_clearance_m < self._stop_clearance_m:
             state = "stop"
-        elif min_clearance_m < _SLOW_DOWN_CLEARANCE_M:
+        elif min_clearance_m < self._slow_down_clearance_m:
             state = "slow_down"
         else:
             state = "nominal"
@@ -300,7 +306,7 @@ class Drive:
 
     def run(self):
         print("[drive] Running. Press Ctrl+C to stop.")
-        period = 1.0 / _LOOP_HZ
+        period = 1.0 / self._loop_hz
         next_tick = time.monotonic()
         last = next_tick
         try:

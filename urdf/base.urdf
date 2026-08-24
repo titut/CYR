@@ -1,0 +1,124 @@
+<?xml version="1.0"?>
+<robot name="mycobot_sim_base">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0.0" rpy="0 0 0"/>
+      <mass value="8.0"/>
+      <inertia ixx="0.38999999999999996" ixy="0" ixz="0" iyy="0.38999999999999996" iyz="0" izz="0.75"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.75 0.75 0.15"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.75 0.75 0.15"/></geometry>
+    </collision>
+  </link>
+  <link name="wheel_drive_L">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0017733333333333331" ixy="0" ixz="0" iyy="0.0017733333333333331" iyz="0" izz="0.0028799999999999997"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.12" length="0.1"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.12" length="0.1"/></geometry>
+    </collision>
+  </link>
+  <joint name="wheel_drive_L_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_drive_L"/>
+    <origin xyz="-0.345 -0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+  <link name="wheel_drive_R">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.4"/>
+      <inertia ixx="0.0017733333333333331" ixy="0" ixz="0" iyy="0.0017733333333333331" iyz="0" izz="0.0028799999999999997"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.12" length="0.1"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.12" length="0.1"/></geometry>
+    </collision>
+  </link>
+  <joint name="wheel_drive_R_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_drive_R"/>
+    <origin xyz="-0.345 0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+  <link name="wheel_free_L_fork">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.05"/><inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><box size="0.04 0.04 0.10"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><geometry><box size="0.04 0.04 0.10"/></geometry></collision>
+  </link>
+  <joint name="wheel_free_L_fork_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_free_L_fork"/>
+    <origin xyz="0.345 -0.345 -0.07500000000000001" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <link name="wheel_free_L">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.4"/><inertia ixx="0.0017733333333333331" ixy="0" ixz="0" iyy="0.0017733333333333331" iyz="0" izz="0.0028799999999999997"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><cylinder radius="0.12" length="0.1"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><geometry><cylinder radius="0.12" length="0.1"/></geometry></collision>
+  </link>
+  <joint name="wheel_free_L_joint" type="continuous">
+    <parent link="wheel_free_L_fork"/>
+    <child link="wheel_free_L"/>
+    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+  <link name="wheel_free_R_fork">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.05"/><inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><box size="0.04 0.04 0.10"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><geometry><box size="0.04 0.04 0.10"/></geometry></collision>
+  </link>
+  <joint name="wheel_free_R_fork_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="wheel_free_R_fork"/>
+    <origin xyz="0.345 0.345 -0.07500000000000001" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+  <link name="wheel_free_R">
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/><mass value="0.4"/><inertia ixx="0.0017733333333333331" ixy="0" ixz="0" iyy="0.0017733333333333331" iyz="0" izz="0.0028799999999999997"/></inertial>
+    <visual><origin xyz="0 0 0" rpy="0 0 0"/><geometry><cylinder radius="0.12" length="0.1"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><geometry><cylinder radius="0.12" length="0.1"/></geometry></collision>
+  </link>
+  <joint name="wheel_free_R_joint" type="continuous">
+    <parent link="wheel_free_R_fork"/>
+    <child link="wheel_free_R"/>
+    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 -1"/>
+  </joint>
+  <link name="arm_mount">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.1"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.10 0.10 0.01"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.10 0.10 0.01"/></geometry>
+    </collision>
+  </link>
+  <joint name="arm_mount_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="arm_mount"/>
+    <origin xyz="0 0 0.075" rpy="0 0 0"/>
+  </joint>
+</robot>

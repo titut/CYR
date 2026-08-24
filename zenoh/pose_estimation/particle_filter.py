@@ -23,7 +23,7 @@ if str(_ZENOH_DIR) not in sys.path:
 
 import numpy as np
 
-from map_format import MapData
+from core.map_format import MapData
 from simulation.raycast import RayHit
 
 

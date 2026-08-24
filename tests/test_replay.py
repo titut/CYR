@@ -15,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from clock import SimClock, seed_all, sleep_until
-from map_format import MapData
+from core.clock import SimClock, seed_all, sleep_until
+from core.map_format import MapData
 from navigation.navigator import closest_segment_index, update_occupancy_log_odds
 from simulation.occupancy_grid import OccupancyGrid
 
@@ -69,7 +69,7 @@ def test_sleep_until_waits_for_future_deadline():
 
 
 def _box_grid() -> OccupancyGrid:
-    from map_format import Wall
+    from core.map_format import Wall
 
     return OccupancyGrid.from_walls(
         [

@@ -1,0 +1,73 @@
+# Default robot description (T-019).  Loaded by every node at startup via
+# robot_config.load_robot_config().  Override with the ROBOT_CONFIG environment
+# variable or a different file path.  Only list what differs from the code
+# defaults; unknown keys and invalid values fail loudly at load time.
+
+name: mycobot_sim
+
+chassis:                        # body geometry + speed limits (kinematics.py)
+  footprint_m: 0.75             # square footprint side length (m)
+  wheel_radius_m: 0.12          # wheel radius (m)
+  wheel_track_m: 0.69           # drive-wheel separation (m); wheels at corners
+  linear_speed_mps: 3.0         # max commanded linear speed (m/s)
+  angular_speed_rps: 3.0        # max commanded angular speed (rad/s)
+  height_m: 0.15                # chassis box height (m)
+  mass_kg: 8.0                  # chassis mass (kg)
+  cg_offset_m: 0.0              # CG offset (keep 0; PyBullet sinks the base otherwise)
+  wheel_width_m: 0.10           # wheel cylinder width (m); wider = better grip
+  wheelbase_m: 0.69             # front/back wheel separation (m)
+
+drive:                          # motor + encoder plant model (drive.py)
+  motor_time_constant_s: 0.05
+  max_wheel_accel_rps2: 35.0
+  max_wheel_decel_rps2: 70.0
+  encoder_noise_rps: 0.05
+  command_timeout_s: 0.5
+  loop_hz: 50
+
+safety:                         # body-clearance safety zones (drive.py)
+  slow_down_clearance_m: 1.0
+  stop_clearance_m: 0.15
+  estop_clearance_m: 0.05
+  reverse_escape_mps: 0.5
+
+sensors:
+  lidar:                        # 2D LIDAR model
+    range_m: 10.0               # max beam range (m)
+    ray_count: 360              # rays per full scan
+    range_noise_m: 0.02         # 1-sigma range noise (m)
+    mount_xyz_m: [0.0, 0.0, 0.2]   # offset from the robot origin (m)
+  imu:
+    gyro_bias_rps: 0.005        # +/- per-run gyro bias
+    gyro_noise_rps: 0.01        # 1-sigma gyro rate noise
+    yaw_noise_rad: 0.05         # 1-sigma absolute yaw noise
+    mount_xyz_m: [0.0, 0.0, 0.05]
+  camera:                       # AprilTag camera model
+    fov_rad: 1.5707963267948966 # 90 deg horizontal field of view
+    max_range_m: 5.0
+    range_noise_m: 0.02
+    bearing_noise_rad: 0.017453292519943295  # 1 deg
+    yaw_noise_rad: 0.03490658503988659       # 2 deg
+    mount_xyz_m: [0.0, 0.0, 0.35]
+
+arm:                            # manipulator on the chassis (3D sim uses this)
+  urdf: urdf/mycobot_280_pi_3d.urdf
+  mount_xyz_m: [0.0, 0.0, 0.27]
+  mount_rpy_rad: [0.0, 0.0, 0.0]
+
+physics:                        # sim-only wheel-ground model (simulator.py)
+  wheel_scale_min: 0.80
+  wheel_scale_max: 1.20
+  track_scale_min: 0.85
+  track_scale_max: 1.15
+  slip_noise: 0.02
+  cross_coupling_rad_per_m: 0.1
+  yaw_compensation_rad_per_m: 0.0   # counter the fixed-wheel curve (tune in sim)
+
+hardware:                       # T-019 driver selection: which implementation
+                                # backs each device.  "sim" = simulated;
+                                # "logging" = no-op stub (proves the pattern).
+  drive:  {driver: sim}
+  lidar:  {driver: sim}
+  imu:    {driver: sim}
+  camera: {driver: sim}

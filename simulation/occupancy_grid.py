@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from map_format import Wall
+from core.map_format import Wall
 
 
 def _bresenham_line(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:

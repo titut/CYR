@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from map_format import MapData, Room, Wall
+from core.map_format import MapData, Room, Wall
 from pose_estimation.particle_filter import ParticleFilter
 from simulation.raycast import cast_rays
 

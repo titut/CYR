@@ -40,21 +40,21 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
-from map_format import MapData, new_empty_map
+from core.constants import LIDAR_MAX_RANGE_M
+from core.map_format import MapData, new_empty_map
+from core.messages import SchemaError, decode, decode_text, encode
+from core.robot_config import get_robot_config
 from simulation.occupancy_grid import OccupancyGrid, _bresenham_line
 from navigation.astar import plan_path
 from navigation.footprint import make_footprint
 from navigation.llm_nav import query_location_async
-from clock import sleep_until
+from core.clock import sleep_until
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-BOT_SIZE_M = 0.75  # Must match simulator.
 _REPLAN_THRESHOLD_M = 1.0  # Replan if bot strays >1 m from path.
-
-LIDAR_MAX_RANGE_M = 10.0  # Must match simulator.
 
 # Probabilistic obstacle detection (T-009): obstacles come from the raw LIDAR
 # point cloud via a log-odds occupancy grid with free-space clearing, instead
@@ -79,6 +79,7 @@ def update_occupancy_log_odds(
     est_y: float,
     est_theta: float,
     rays,
+    max_range_m: float = LIDAR_MAX_RANGE_M,
 ) -> np.ndarray:
     """Update a log-odds occupancy array from one LIDAR scan (T-009).
 
@@ -100,7 +101,7 @@ def update_occupancy_log_odds(
     for entry in rays:
         angle = est_theta + float(entry["angle_rad"])
         dist = float(entry["distance_m"])
-        hit_dist = min(dist, LIDAR_MAX_RANGE_M)
+        hit_dist = min(dist, max_range_m)
         hx = est_x + hit_dist * math.cos(angle)
         hy = est_y + hit_dist * math.sin(angle)
         gx1, gy1 = grid.world_to_grid(hx, hy)
@@ -114,7 +115,7 @@ def update_occupancy_log_odds(
                     lo[gy, gx] -= _LO_FREE_DEC
 
         # The hit cell itself is occupied — unless it is a known wall.
-        if dist < LIDAR_MAX_RANGE_M:
+        if dist < max_range_m:
             if 0 <= gx1 < grid.cols and 0 <= gy1 < grid.rows:
                 if not grid.grid[gy1, gx1]:
                     lo[gy1, gx1] += _LO_OCCUPIED_INC
@@ -159,7 +160,12 @@ class Navigator:
         )
 
         self.map_data = self._load_map(map_path)
-        self.bot_radius = BOT_SIZE_M / 2.0
+
+        # Robot description (T-019): footprint and LIDAR specs from robot.yaml.
+        cfg = get_robot_config()
+        self._cfg = cfg
+        self.bot_radius = cfg.chassis.radius_m
+        self._lidar_range_m = cfg.sensors.lidar.range_m
 
         # Occupancy grids + footprint for planning.
         self._grid_resolution = 0.25  # meters per grid cell
@@ -245,18 +251,19 @@ class Navigator:
     def _on_pose(self, sample):
         """Update the latest estimated pose."""
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("estimate/pose", sample)
             self._est_x = float(data["x_m"])
             self._est_y = float(data["y_m"])
             self._est_theta = float(data["theta_rad"])
-        except (json.JSONDecodeError, KeyError, Exception):
-            pass
+        except SchemaError as exc:
+            logging.warning("estimate/pose dropped: %s", exc)
 
     def _on_lidar(self, sample):
         """Store the latest LIDAR scan for obstacle detection."""
         try:
-            scan = json.loads(sample.payload.to_string())
-        except (json.JSONDecodeError, Exception):
+            scan = decode("sensor/lidar", sample)
+        except SchemaError as exc:
+            logging.warning("sensor/lidar dropped: %s", exc)
             return
         with self._lidar_lock:
             self._latest_lidar = scan
@@ -264,10 +271,10 @@ class Navigator:
     def _on_goal(self, sample):
         """A user clicked a point on the map. Plan a path to it."""
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("nav/goal", sample)
             target = (float(data["x_m"]), float(data["y_m"]))
-        except (json.JSONDecodeError, KeyError, Exception) as exc:
-            logging.warning("Failed to parse nav/goal: %s", exc)
+        except SchemaError as exc:
+            logging.warning("nav/goal dropped: %s", exc)
             return
 
         self._nav_target = target
@@ -280,8 +287,12 @@ class Navigator:
 
     def _on_command(self, sample):
         """A user typed an LLM command. Resolve to coordinates, then plan."""
-        text = sample.payload.to_string().strip()
-        if not text or not self._api_key:
+        try:
+            text = decode_text("nav/command", sample)
+        except SchemaError as exc:
+            logging.warning("nav/command dropped: %s", exc)
+            return
+        if not self._api_key:
             logging.warning("No API key or empty command.")
             return
 
@@ -392,6 +403,7 @@ class Navigator:
             self._est_y,
             self._est_theta,
             scan.get("rays", []),
+            max_range_m=self._lidar_range_m,
         )
 
         # Rebuild the combined planning grid: walls OR dynamic-occupied.
@@ -409,11 +421,12 @@ class Navigator:
 
     def _publish_detection(self, particles: List[Tuple[float, float]]) -> None:
         """Publish the detected obstacle points for the simulator to display."""
-        msg = json.dumps(
+        msg = encode(
+            "detection/obstacles",
             {
                 "t": time.time(),
                 "points": [[round(p[0], 3), round(p[1], 3)] for p in particles],
-            }
+            },
         )
         self._pub_detection.put(msg)
 

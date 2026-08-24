@@ -10,7 +10,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-from map_format import Obstacle, Wall
+from core.map_format import Obstacle, Wall
 
 
 @dataclass(frozen=True)

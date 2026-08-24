@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from map_format import Wall
+from core.map_format import Wall
 from simulation.occupancy_grid import OccupancyGrid, _bresenham_line
 
 

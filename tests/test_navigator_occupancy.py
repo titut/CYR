@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from map_format import Wall
+from core.map_format import Wall
 from navigation.navigator import closest_segment_index, update_occupancy_log_odds
 from simulation.occupancy_grid import OccupancyGrid
 

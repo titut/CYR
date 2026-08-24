@@ -11,7 +11,7 @@ import logging
 import threading
 from typing import Optional, Tuple
 
-from map_format import MapData
+from core.map_format import MapData
 
 _log = logging.getLogger("llm_nav")
 

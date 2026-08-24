@@ -37,7 +37,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
-from clock import sleep_until
+from core.clock import sleep_until
 
 
 class Logger:

@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from map_format import Wall
+from core.map_format import Wall
 from navigation.footprint import make_footprint
 from navigation.rrt import plan_path
 from simulation.occupancy_grid import OccupancyGrid

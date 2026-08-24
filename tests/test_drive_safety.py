@@ -8,9 +8,9 @@ from control.drive import (
     _ESTOP_CLEARANCE_M,
     _SLOW_DOWN_CLEARANCE_M,
     _STOP_CLEARANCE_M,
-    _velocity_step,
     Drive,
 )
+from core.sim_drivers import _velocity_step
 
 _safety_limit = Drive._safety_limited_linear
 

@@ -24,7 +24,6 @@ Defaults to test_map.json if no map is provided.
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 import threading
@@ -45,23 +44,22 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
 
-from map_format import MapData, Apriltag, new_empty_map
+from core.map_format import MapData, Apriltag, new_empty_map
+from core.messages import SchemaError, decode, encode
 from pose_estimation.heading_filter import HeadingFilter
 from pose_estimation.particle_filter import ParticleFilter
+from core.robot_config import get_robot_config
 from simulation.kinematics import wheel_to_unicycle
 from simulation.raycast import RayHit
 
 # ---------------------------------------------------------------------------
-# Configuration (mirrors simulation/simulator.py)
+# Configuration
 # ---------------------------------------------------------------------------
 
-LIDAR_MAX_RANGE_M = 10.0
-
-# AprilTag camera measurement noise (mirrors simulation/simulator.py).  Used to
-# derive the anchor measurement's covariance instead of hardcoding it.
-CAMERA_RANGE_NOISE_M = 0.02
-CAMERA_BEARING_NOISE_RAD = math.radians(1.0)
-CAMERA_YAW_NOISE_RAD = math.radians(2.0)
+# AprilTag camera measurement noise and LIDAR range come from the robot config
+# (robot.yaml), the single source shared with the simulator's sensor models.
+# They are used to derive the anchor measurement's covariance instead of
+# hardcoding it.
 
 # After an AprilTag anchor, keep random particle injection localized to the
 # current estimate (rather than global across the map) for this many seconds.
@@ -86,12 +84,19 @@ class PoseEstimator:
         # Load the same map the simulator uses (geometry is in meters).
         self.map_data = self._load_map(map_path)
 
+        # Robot description (T-019): LIDAR range + camera noise from robot.yaml,
+        # matching what the simulator's sensor models use.
+        cfg = get_robot_config()
+        self._cfg = cfg
+        self._lidar_range_m = cfg.sensors.lidar.range_m
+        self._cam_noise = cfg.sensors.camera
+
         # Particle filter (same parameters as the old simulator).
         self.pf = ParticleFilter(
             self.map_data,
             num_particles=200,
             num_beams=36,
-            max_range_m=LIDAR_MAX_RANGE_M,
+            max_range_m=self._lidar_range_m,
         )
         self._pf_lock = threading.Lock()
         self._initialized = False
@@ -220,14 +225,13 @@ class PoseEstimator:
         the heading filter.  Never touches the particle filter directly.
         """
         try:
-            payload = sample.payload.to_string()
-            wheel_data = json.loads(payload)
+            wheel_data = decode("sensor/wheel_speed", sample)
             left_rps = float(wheel_data["left_rps"])
             right_rps = float(wheel_data["right_rps"])
-            t = float(wheel_data.get("t", time.time()))
+            t = float(wheel_data["t"])
             linear_mps, angular_rps = wheel_to_unicycle(left_rps, right_rps)
-        except (json.JSONDecodeError, Exception) as exc:
-            print(f"[pose_estimator] Failed to parse wheel speed message: {exc}")
+        except SchemaError as exc:
+            print(f"[pose_estimator] sensor/wheel_speed dropped: {exc}")
             return
 
         if self._last_wheel_time is not None:
@@ -255,12 +259,13 @@ class PoseEstimator:
         available up to each LIDAR scan's capture time.
         """
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("sensor/imu", sample)
             gyro_rps = float(data["angular_velocity_rps"])
             yaw = data.get("yaw_rad")
             yaw = float(yaw) if yaw is not None else None
-            t = float(data.get("t", time.time()))
-        except (json.JSONDecodeError, Exception):
+            t = float(data["t"])
+        except SchemaError as exc:
+            print(f"[pose_estimator] sensor/imu dropped: {exc}")
             return
 
         if self._last_imu_time is not None:
@@ -288,10 +293,11 @@ class PoseEstimator:
         its own lock.
         """
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("detection/apriltag", sample)
             dets = data.get("detections", [])
             tag_t = data.get("t")
-        except (json.JSONDecodeError, Exception):
+        except SchemaError as exc:
+            print(f"[pose_estimator] detection/apriltag dropped: {exc}")
             return
         with self._tag_det_lock:
             self._latest_tag_dets = (tag_t, dets)
@@ -356,11 +362,11 @@ class PoseEstimator:
                 # detection geometry (distance to the tag).
                 range_m = math.hypot(x_rel_m, y_rel_m)
                 std_xy = math.sqrt(
-                    CAMERA_RANGE_NOISE_M ** 2
-                    + (range_m * CAMERA_BEARING_NOISE_RAD) ** 2
-                    + (range_m * CAMERA_YAW_NOISE_RAD) ** 2
+                    self._cam_noise.range_noise_m ** 2
+                    + (range_m * self._cam_noise.bearing_noise_rad) ** 2
+                    + (range_m * self._cam_noise.yaw_noise_rad) ** 2
                 )
-                std_theta = CAMERA_YAW_NOISE_RAD
+                std_theta = self._cam_noise.yaw_noise_rad
 
                 self._retroactively_fuse(
                     anchor_x, anchor_y, anchor_theta, std_xy, std_theta, tag_t
@@ -558,10 +564,9 @@ class PoseEstimator:
             return
 
         try:
-            payload = sample.payload.to_string()
-            lidar_data = json.loads(payload)
-        except (json.JSONDecodeError, Exception) as exc:
-            print(f"[pose_estimator] Failed to parse LIDAR message: {exc}")
+            lidar_data = decode("sensor/lidar", sample)
+        except SchemaError as exc:
+            print(f"[pose_estimator] sensor/lidar dropped: {exc}")
             return
 
         scan_t = lidar_data.get("t")
@@ -608,7 +613,8 @@ class PoseEstimator:
 
     def _publish_pose(self):
         """Publish the estimated pose (and its covariance) as JSON."""
-        msg = json.dumps(
+        msg = encode(
+            "estimate/pose",
             {
                 "x_m": self.estimated_x,
                 "y_m": self.estimated_y,
@@ -618,7 +624,7 @@ class PoseEstimator:
                 "track_scale": self._track_scale,
                 "gyro_bias": self._gyro_bias,
                 "t": time.time(),
-            }
+            },
         )
         self._pub_pose.put(msg)
 

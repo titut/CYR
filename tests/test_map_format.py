@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from map_format import MapData, Obstacle, Wall, new_empty_map
+from core.map_format import MapData, Obstacle, Wall, new_empty_map
 
 
 def _sample_map() -> MapData:

@@ -38,9 +38,9 @@ def test_pure_rotation_opposite_wheels():
     assert r == pytest.approx(2.0 * WHEEL_TRACK_M / 2.0 / WHEEL_RADIUS_M)
 
 
-def test_track_matches_footprint_and_wheels():
-    # Wheels sit flush with the footprint edges, inset by the wheel radius.
-    assert WHEEL_TRACK_M == pytest.approx(BOT_SIZE_M - 2.0 * WHEEL_RADIUS_M)
+def test_track_matches_config():
+    # With corner wheels the drive track is the config value, not derived.
+    assert WHEEL_TRACK_M == pytest.approx(0.69)
 
 
 def test_square_footprint_radius_bounds():

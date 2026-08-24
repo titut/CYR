@@ -24,7 +24,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from typing import List, Optional, Tuple
 
-from map_format import Apriltag, MapData, Metadata, Obstacle, Room, Wall, new_empty_map
+# Allow running this file directly (python map_editor/editor.py): the project
+# root must be on sys.path for `core.*` imports.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from core.map_format import Apriltag, MapData, Metadata, Obstacle, Room, Wall, new_empty_map
 
 CANVAS_MARGIN = 20
 GRID_SPACING = 20

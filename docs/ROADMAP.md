@@ -34,21 +34,17 @@
 | T-006 | Real camera model + AprilTag detector | P1 | Perception | L | — |
 | T-007 | Object detection / free-space segmentation | P2 | Perception | XL | T-006 |
 | T-008 | 3D / 2.5D support | P3 | Perception | XL | T-017 |
-| T-009 | Pose-independent obstacle detection (probabilistic costmap) | P0 | Navigation | L | — |
-| T-012 | Costmap layering (static/inflation/dynamic/semantic) | P1 | Navigation | M | T-009 |
-| T-013 | Dynamic obstacle detection, tracking, prediction | P1 | Navigation | XL | T-009 |
+| T-012 | Costmap layering (static/inflation/dynamic/semantic) | P1 | Navigation | M | — |
+| T-013 | Dynamic obstacle detection, tracking, prediction | P1 | Navigation | XL | — |
 | T-014 | Recovery behaviors | P1 | Navigation | M | — |
-| T-016 | Safety architecture (soft-stop tiers, latched e-stop) | P0 | Control & Safety | L | — |
 | T-017 | SLAM (scan-to-submap, loop closure, pose graph) | P1 | SLAM & Maps | XL | — |
 | T-018 | Multi-session / metric-semantic maps | P2 | SLAM & Maps | L | T-017 |
 | T-019 | Hardware Abstraction Layer + config-driven parameters | P1 | Universal OS | L | — |
-| T-020 | Deterministic clock + sim-time/replay | P1 | Universal OS | M | T-019 |
 | T-021 | Typed, versioned message schema | P1 | Universal OS | M | — |
 | T-022 | Cross-platform build/deploy (ARM/Jetson) | P2 | Universal OS | M | T-019 |
 | T-023 | Orchestration, supervisor, watchdog, health monitor | P1 | Reliability | M | — |
-| T-024 | Structured logging, telemetry, latency, replay | P1 | Reliability | M | T-020 |
-| T-025 | Safety/security process (hazard analysis, secrets) | P2 | Reliability | M | T-016 |
-| T-026 | Test suite + CI | P1 | Quality | M | T-020 |
+| T-024 | Structured logging, telemetry, latency, replay | P1 | Reliability | M | — |
+| T-025 | Safety/security process (hazard analysis, secrets) | P2 | Reliability | M | — |
 | T-027 | Dedupe constants + `map_format` single source of truth | P2 | Quality | S | — |
 | T-028 | Performance: vectorize PF, native serialization | P2 | Quality | M | — |
 
@@ -95,25 +91,10 @@ costmap.
 
 ## Epic: Navigation & Planning
 
-### T-009 — Pose-independent obstacle detection (probabilistic costmap)
-- **Priority:** P0
-- **Effort:** L
-- **Depends on:** —
-- **Status:** Done
-
-**Problem:** `navigator.py::_detect_obstacle_particles` renders an "expected
-wall-only scan" from the *estimated* pose and flags any beam 0.3 m shorter as an
-obstacle. Pose error (~0.3 m) produces ghost obstacles; the 2-hit confirmation
-is a symptom patch, not a fix.
-
-**Done when:** obstacles come from the raw point cloud registered to the map or a
-probabilistic occupancy update, not from comparing against a pose-rendered
-reference scan.
-
 ### T-012 — Costmap layering
 - **Priority:** P1
 - **Effort:** M
-- **Depends on:** T-009
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** the "costmap" is a binary hit-count dict rebuilt from scratch every
@@ -124,7 +105,7 @@ reference scan.
 ### T-013 — Dynamic obstacle detection, tracking, prediction
 - **Priority:** P1
 - **Effort:** XL
-- **Depends on:** T-009
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** moving objects are treated as static clutter; no tracks, no
@@ -144,23 +125,6 @@ blocked local plan.
 
 **Done when:** recovery behaviors (reverse, rotate-in-place, clear-costmap) run
 before declaring failure.
-
----
-
-## Epic: Motion Control & Safety
-
-### T-016 — Safety architecture
-- **Priority:** P0
-- **Effort:** L
-- **Depends on:** —
-- **Status:** Done
-
-**Problem:** e-stop sets wheel speed to zero instantly (infinite deceleration),
-doesn't latch or zero the command, and rides on best-effort LIDAR from a perfect
-simulator. No slow-down tier, no safety-rated channel.
-
-**Done when:** slow-down zone → stop zone → latched e-stop requiring reset, on a
-safety-rated channel (documented IEC 61508 / ISO 3691-4 path for hardware).
 
 ---
 
@@ -196,7 +160,7 @@ scan-to-submap) and relocalizes after kidnapping.
 - **Priority:** P1
 - **Effort:** L
 - **Depends on:** —
-- **Status:** Backlog
+- **Status:** Done
 
 **Problem:** the code is hardwired to one sim (constants like `BOT_SIZE_M`,
 `LIDAR_MAX_RANGE_M` copy-pasted with "must match" comments). This is the core
@@ -206,30 +170,21 @@ enabler for the north star — same software on any hardware.
 configuration layer; zero hardcoded robot constants; a new robot is added by
 writing a driver + config, not by editing the brains.
 
-### T-020 — Deterministic clock + sim-time/replay
-- **Priority:** P1
-- **Effort:** M
-- **Depends on:** T-019
-- **Status:** Done
-
-**Problem:** `time.time()` for durations (can jump), `time.sleep(dt)` loops
-(jitter, not deadline-driven), no clock abstraction, no sim-time, no replay.
-
-**Done when:** monotonic clocks for durations, deadline-driven loops, a clock
-abstraction (wall vs sim time) enabling deterministic replay.
-
-**Status note:** `clock.py` provides `Clock`/`WallClock`/`SimClock`,
-`sleep_until` and `seed_all`.  All node main loops are deadline-driven
-(`sleep_until` pacing — no cumulative drift), durations use
-`time.monotonic()`, and `zenoh/replay.py` replays a recorded JSONL session back
-onto Zenoh paced by its timestamps (`--speed`, `--topics`, `--dry-run`), which
-the deterministic replay tests build on.
+**Status note:** `core/robot_config.py` + `robot.yaml` (project root, overridable
+via `ROBOT_CONFIG`) describe the robot — chassis, drive plant, safety zones,
+sensor specs + mounts, arm, sim physics, and the `hardware:` driver selection.
+The driver model (`core/hal.py` + `core/sim_drivers.py`) defines the
+`DriveDriver` / `LidarDriver` / `ImuDriver` / `CameraDriver` interfaces and
+provides the sim implementations; the drive node loads its driver from config
+(`sim` or the `logging` stub), and the simulator's sensors go through the same
+interfaces. A new hardware backend = a driver class + a config line, no brain
+edits. Covered by `tests/test_robot_config.py` and `tests/test_hal.py`.
 
 ### T-021 — Typed, versioned message schema
 - **Priority:** P1
 - **Effort:** M
 - **Depends on:** —
-- **Status:** Backlog
+- **Status:** Done
 
 **Problem:** ad-hoc JSON with no schema/versioning; callbacks do
 `except (json.JSONDecodeError, KeyError, Exception)` swallowing every error
@@ -237,6 +192,15 @@ silently.
 
 **Done when:** typed, versioned messages (or a schema registry) with explicit
 error handling; malformed messages are logged, not silently dropped.
+
+**Status note:** `core/messages.py` is the schema registry — every dict message
+carries a version (`v`) and is validated field-by-field (types, required keys,
+ray/pair shapes) by `encode()`/`decode()`. Text topics (`nav/command`,
+`safety/reset`) and the array topic (`nav/path`) have dedicated helpers. All
+producers/consumers across `simulation/simulator.py` and the zenoh nodes
+(controller, drive, pose_estimator, navigator, apriltag detector) use it;
+malformed messages raise `SchemaError` and are logged by topic instead of being
+silently dropped. Covered by `tests/test_messages.py`.
 
 ### T-022 — Cross-platform build/deploy
 - **Priority:** P2
@@ -267,7 +231,7 @@ watchdog/health checks and auto-restart.
 ### T-024 — Structured logging, telemetry, latency, replay
 - **Priority:** P1
 - **Effort:** M
-- **Depends on:** T-020
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** `print()`-based logging, no telemetry, no end-to-end latency
@@ -279,7 +243,7 @@ of all sensor/command streams.
 ### T-025 — Safety/security process
 - **Priority:** P2
 - **Effort:** M
-- **Depends on:** T-016
+- **Depends on:** —
 - **Status:** Backlog
 
 **Problem:** no hazard analysis (STPA/FMEA), no threat model, no safety case.
@@ -291,35 +255,24 @@ uniformly; safety requirements traceable to code.
 
 ## Epic: Quality & Tooling
 
-### T-026 — Test suite + CI
-- **Priority:** P1
-- **Effort:** M
-- **Depends on:** T-020
-- **Status:** Done
-
-**Problem:** ~6000 lines, zero tests, no CI. Regression risk on every change.
-
-**Done when:** unit + integration tests (PF convergence, planner correctness,
-deterministic replay) running in CI on every commit.
-
-**Status note:** 83 unit + integration tests (map format, kinematics, occupancy
-grid, footprint incl. the circumradius regression, A*/RRT*, particle filter,
-heading filter, controller corner turns, drive safety zones, navigator
-occupancy, and deterministic replay incl. a recorded-failure regression) pass
-via `make test`. CI-on-every-commit is wired but deferred to GitHub Actions —
-the layout is CI-ready (`requirements-dev.txt` + `pytest.ini` + `tests/`).
-
 ### T-027 — Dedupe constants + `map_format` single source of truth
 - **Priority:** P2
 - **Effort:** S
 - **Depends on:** —
-- **Status:** Backlog
+- **Status:** Done
 
 **Problem:** `map_format.py` and `map_editor/map_format.py` are identical
 234-line copies; `LIDAR_MAX_RANGE_M` / `BOT_SIZE_M` duplicated across 3-4 files.
 
 **Done when:** one canonical `map_format` and one constants module; no "must
 match" comments.
+
+**Status note:** `core/constants.py` is the single source of truth for
+robot/sensor constants; `simulation/kinematics.py` derives the wheel model from
+it and re-exports the names (existing imports unchanged), and the simulator,
+navigator and pose estimator import from it. `map_format` lives once in
+`core/map_format.py`; the map editor's private duplicate was removed. No "must
+match" comments remain. Covered by `tests/test_constants.py`.
 
 ### T-028 — Performance: vectorize PF, native serialization
 - **Priority:** P2
@@ -337,18 +290,28 @@ native/binary serialization on hot paths.
 
 ## Suggested next work
 
-The critical path (localization measurement model, drive model, local/global
-planners, probabilistic obstacle detection, safety architecture, test suite,
-clock abstraction + replay) is done.  The highest-leverage remaining work,
-roughly in order:
+Done work has been removed from the backlog (T-009 probabilistic costmap,
+T-016 safety architecture, T-020 deterministic clock/replay, T-026 test suite +
+CI). The next major feature is the 3D mobile-manipulation simulation
+(`SIMULATION3D_SPEC.md` — PyBullet mobile base + mycobot arm + gripper +
+pick-and-place), which reuses the existing zenoh nav stack unchanged.
 
-1. **T-019** — HAL + config-driven parameters. The foundation of the
-   "universal OS" north star; unlocks T-021–T-024 and T-022.
-2. **T-012 + T-013** — layered costmap, then dynamic-obstacle tracking.
-3. **T-027** — constant dedup (`map_format` single source of truth, no "must
-   match" comments) — a cheap hygiene win.
+The prerequisite tickets for the simulation have landed: **T-027** (single
+source of truth in `core/constants.py` + canonical `core/map_format`), **T-021**
+(schema registry in `core/messages.py`), and **T-019** (full HAL: `robot.yaml` +
+`core/robot_config.py` config layer and the `core/hal.py`/`core/sim_drivers.py`
+driver model). The PyBullet sim can now plug in as another config-driven backend
+behind the same driver interfaces and zenoh topics.
 
-After this, T-017 (SLAM) is the moat that separates a demo from a product.
+Recommended to run alongside the sim work (not blockers, plan in parallel):
+
+1. **T-023** — orchestration/supervisor, so the multi-node stack (`sim3d.sh`)
+   gets lifecycle/health management rather than a raw process list.
+2. **T-012 + T-014** — layered costmap and recovery behaviors; independent of
+   the sim, high-value once the 3D stack is driving.
+
+After the simulation, T-017 (SLAM) remains the moat that separates a demo from a
+product.
 
 ---
 

@@ -37,7 +37,6 @@ Zenoh topics:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -57,9 +56,12 @@ _PROJECT_ROOT = _SCRIPT_DIR.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from map_format import MapData, Obstacle, Wall, new_empty_map
-from simulation.kinematics import BOT_RADIUS_M, wheel_to_unicycle
-from simulation.raycast import RayHit, cast_rays
+from core.hal import load_camera_driver, load_imu_driver, load_lidar_driver
+from core.map_format import MapData, Obstacle, Wall, new_empty_map
+from core.messages import SchemaError, decode, decode_path, encode, encode_text
+from core.robot_config import get_robot_config
+from simulation.kinematics import wheel_to_unicycle
+from simulation.raycast import RayHit
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -70,16 +72,6 @@ WINDOW_HEIGHT = 800
 TAB_BAR_HEIGHT = 44
 CHAT_BAR_HEIGHT = 36
 FPS = 60
-
-LIDAR_MAX_RANGE_M = 10.0
-LIDAR_RAY_COUNT = 360
-
-# AprilTag camera simulation.
-CAMERA_FOV_RAD = math.radians(90)  # horizontal field of view
-CAMERA_MAX_RANGE_M = 5.0  # max detection distance
-CAMERA_RANGE_NOISE_M = 0.02  # 1σ Gaussian noise on range measurement
-CAMERA_BEARING_NOISE_RAD = math.radians(1.0)  # 1σ Gaussian noise on bearing
-CAMERA_YAW_NOISE_RAD = math.radians(2.0)  # 1σ Gaussian noise on tag yaw
 
 COLORS = {
     "bg": (245, 245, 245),
@@ -112,21 +104,13 @@ COLORS = {
 # Wheel-ground errors: independent wheel-radius and track calibration errors,
 # plus a small cross-coupling (differential drives couple linear motion into
 # rotation) and per-step slip noise.  These corrupt ground truth relative to
-# what the wheel encoders report, so odometry drifts from truth.
-_WHEEL_SCALE_MIN = 0.80
-_WHEEL_SCALE_MAX = 1.20
-_TRACK_SCALE_MIN = 0.85
-_TRACK_SCALE_MAX = 1.15
-_SLIP_NOISE = 0.02
-_CROSS_COUPLING_RAD_PER_M = 0.1
+# what the wheel encoders report, so odometry drifts from truth.  Values come
+# from the robot config (robot_config.PhysicsConfig).
 
 # IMU realism: a small per-run gyro bias plus per-sample Gaussian noise on the
 # reported angular rate, and Gaussian noise on the absolute yaw (a
 # magnetometer-like reference).  The gyro bias drifts heading slowly; the yaw
-# has noise but no drift.
-IMU_GYRO_BIAS_RPS = 0.005  # ± half-range of the per-run bias
-IMU_GYRO_NOISE_RPS = 0.01  # 1σ Gaussian noise on the gyro rate
-IMU_YAW_NOISE_RAD = 0.05  # 1σ Gaussian noise on the absolute yaw
+# has noise but no drift.  Values come from the robot config (ImuConfig).
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +201,22 @@ class Simulator:
         # editor's canvas calibration.
         self.px_per_m = 1.0 / raw_map.metadata.scale_m_per_px
         self.map_data = raw_map
-        self.bot_radius_m = BOT_RADIUS_M
+
+        # Robot description (T-019): every physical/sensor parameter comes from
+        # the robot config (robot.yaml), and the sensor models are behind the
+        # driver interfaces (hal) selected by the config's hardware section.
+        self._cfg = get_robot_config()
+        self._camera = self._cfg.sensors.camera  # also used for the GUI overlays
+        self._physics = self._cfg.physics
+        self._lidar_driver = load_lidar_driver(self._cfg)
+        self._imu_driver = load_imu_driver(self._cfg)
+        self._camera_driver = load_camera_driver(self._cfg)
+
+        self.bot_radius_m = self._cfg.chassis.radius_m
         # Physics collision radius: the square's circumradius, so the collision
         # check conservatively bounds the body in any orientation.  (A half-side
         # 0.375 m square's corners reach 0.53 m when rotated 45°.)
-        self._collision_radius_m = BOT_RADIUS_M * math.sqrt(2.0)
+        self._collision_radius_m = self._cfg.chassis.collision_radius_m
 
         # Bot state in meters and radians.
         start_center = (
@@ -252,11 +247,12 @@ class Simulator:
         # Wheel slip simulation: independent wheel-radius and track calibration
         # errors per run, so odometry drifts from truth in both distance and
         # heading.
-        self._wheel_scale = random.uniform(_WHEEL_SCALE_MIN, _WHEEL_SCALE_MAX)
-        self._track_scale = random.uniform(_TRACK_SCALE_MIN, _TRACK_SCALE_MAX)
-
-        # IMU gyro bias per run.
-        self._gyro_bias = random.uniform(-IMU_GYRO_BIAS_RPS, IMU_GYRO_BIAS_RPS)
+        self._wheel_scale = random.uniform(
+            self._physics.wheel_scale_min, self._physics.wheel_scale_max
+        )
+        self._track_scale = random.uniform(
+            self._physics.track_scale_min, self._physics.track_scale_max
+        )
 
         # Measured wheel speeds from the drive node (rad/s).
         self._wheel_lock = threading.Lock()
@@ -350,46 +346,46 @@ class Simulator:
     def _on_estimate_pose(self, sample):
         """Receive estimated pose from pose_estimator."""
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("estimate/pose", sample)
             with self._est_lock:
                 self.guess_x = float(data["x_m"])
                 self.guess_y = float(data["y_m"])
                 self.guess_theta = float(data["theta_rad"])
-        except (json.JSONDecodeError, KeyError, Exception) as exc:
-            logging.warning("Failed to parse estimate/pose: %s", exc)
+        except SchemaError as exc:
+            logging.warning("estimate/pose dropped: %s", exc)
 
     def _on_nav_path(self, sample):
         """Receive planned path from navigator (for display only)."""
         try:
-            waypoints = json.loads(sample.payload.to_string())
+            waypoints = decode_path("nav/path", sample)
             if not waypoints:
                 logging.warning("Navigator returned empty path.")
                 self.nav_path = []
                 return
             self.nav_path = [tuple(p) for p in waypoints]
             logging.info("Received path with %d waypoints.", len(self.nav_path))
-        except (json.JSONDecodeError, Exception) as exc:
-            logging.warning("Failed to parse nav/path: %s", exc)
+        except SchemaError as exc:
+            logging.warning("nav/path dropped: %s", exc)
 
     def _on_detection(self, sample):
         """Receive obstacle points detected by the navigator (for display)."""
         try:
-            data = json.loads(sample.payload.to_string())
-            points = [tuple(p) for p in data.get("points", [])]
+            data = decode("detection/obstacles", sample)
+            points = [tuple(p) for p in data["points"]]
             with self._detection_lock:
                 self._detected_obstacles = points
-        except (json.JSONDecodeError, Exception) as exc:
-            logging.warning("Failed to parse detection/obstacles: %s", exc)
+        except SchemaError as exc:
+            logging.warning("detection/obstacles dropped: %s", exc)
 
     def _on_wheel_speed(self, sample):
         """Receive measured wheel speeds from the drive node."""
         try:
-            data = json.loads(sample.payload.to_string())
+            data = decode("sensor/wheel_speed", sample)
             with self._wheel_lock:
                 self._left_rps = float(data["left_rps"])
                 self._right_rps = float(data["right_rps"])
-        except (json.JSONDecodeError, KeyError, Exception) as exc:
-            logging.warning("Failed to parse sensor/wheel_speed: %s", exc)
+        except SchemaError as exc:
+            logging.warning("sensor/wheel_speed dropped: %s", exc)
 
     # -----------------------------------------------------------------------
     # Publishing
@@ -400,35 +396,30 @@ class Simulator:
         now = time.time()
 
         # LIDAR.
-        lidar_msg = json.dumps(
+        lidar_msg = encode(
+            "sensor/lidar",
             {
                 "t": now,
                 "rays": [
                     {"angle_rad": hit.angle, "distance_m": hit.distance}
                     for hit in self.lidar_hits
                 ],
-            }
+            },
         )
         self._pub_lidar.put(lidar_msg)
 
-        # IMU.
-        noisy_yaw = math.atan2(
-            math.sin(self.bot_theta + random.gauss(0.0, IMU_YAW_NOISE_RAD)),
-            math.cos(self.bot_theta + random.gauss(0.0, IMU_YAW_NOISE_RAD)),
-        )
-        imu_msg = json.dumps(
+        # IMU (through the configured IMU driver, which adds bias + noise).
+        imu = self._imu_driver.read(self.bot_theta, self.angular_velocity)
+        imu_msg = encode(
+            "sensor/imu",
             {
                 "t": now,
-                "yaw_rad": noisy_yaw,
+                "yaw_rad": imu["yaw_rad"],
                 "pitch_rad": 0.0,
                 "roll_rad": 0.0,
-                "angular_velocity_rps": (
-                    self.angular_velocity
-                    + self._gyro_bias
-                    + random.gauss(0.0, IMU_GYRO_NOISE_RPS)
-                ),
+                "angular_velocity_rps": imu["angular_velocity_rps"],
                 "linear_acceleration_mps2": {"x": 0.0, "y": 0.0, "z": 0.0},
-            }
+            },
         )
         self._pub_imu.put(imu_msg)
 
@@ -478,7 +469,7 @@ class Simulator:
                 self.zoom = max(0.2, self.zoom / 1.1)
             elif event.key == pygame.K_r:
                 # Clear a latched drive e-stop (T-016).
-                self._pub_safety_reset.put("reset")
+                self._pub_safety_reset.put(encode_text("safety/reset", "reset"))
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1 and event.pos[1] <= TAB_BAR_HEIGHT:
                 tab_width = WINDOW_WIDTH // len(self.tabs)
@@ -497,7 +488,9 @@ class Simulator:
                     self.zoom,
                 )
                 # Publish nav/goal so the navigator plans a path.
-                self._pub_goal.put(json.dumps({"x_m": world[0], "y_m": world[1]}))
+                self._pub_goal.put(
+                    encode("nav/goal", {"x_m": world[0], "y_m": world[1]})
+                )
                 self.nav_target = world
             elif event.button == 3 and self.active_tab == 0:
                 self.nav_target = None
@@ -517,20 +510,25 @@ class Simulator:
             "s": bool(keys[pygame.K_s]),
             "d": bool(keys[pygame.K_d]),
         }
-        self._pub_wasd.put(json.dumps(wasd))
+        self._pub_wasd.put(encode("sensor/wasd", wasd))
 
         # Drive the bot from the measured wheel speeds published by the drive
         # node.  The drive node reports encoder values (motor + encoder error);
         # wheel-ground slip is applied here, in the physics step.
         with self._wheel_lock:
             left_rps, right_rps = self._left_rps, self._right_rps
-        linear, angular = wheel_to_unicycle(left_rps, right_rps)
+        linear, angular = wheel_to_unicycle(
+            left_rps,
+            right_rps,
+            wheel_radius_m=self._cfg.chassis.wheel_radius_m,
+            wheel_track_m=self._cfg.chassis.wheel_track_m,
+        )
 
         actual_linear = linear * self._wheel_scale
         actual_angular = angular * self._wheel_scale / self._track_scale
-        actual_angular += actual_linear * _CROSS_COUPLING_RAD_PER_M
-        actual_linear += random.gauss(0.0, _SLIP_NOISE * abs(actual_linear))
-        actual_angular += random.gauss(0.0, _SLIP_NOISE * abs(actual_angular))
+        actual_angular += actual_linear * self._physics.cross_coupling_rad_per_m
+        actual_linear += random.gauss(0.0, self._physics.slip_noise * abs(actual_linear))
+        actual_angular += random.gauss(0.0, self._physics.slip_noise * abs(actual_angular))
 
         self.linear_velocity = actual_linear
         self.angular_velocity = actual_angular
@@ -557,13 +555,10 @@ class Simulator:
         self.camera_x += (self.bot_x - self.camera_x) * 0.1
         self.camera_y += (self.bot_y - self.camera_y) * 0.1
 
-        self.lidar_hits = cast_rays(
+        self.lidar_hits = self._lidar_driver.scan(
             origin=(self.bot_x, self.bot_y),
             forward_direction=self.bot_theta,
             walls=self.map_data.walls,
-            num_rays=LIDAR_RAY_COUNT,
-            max_range=LIDAR_MAX_RANGE_M,
-            fov_rad=2.0 * math.pi,
             obstacles=self.map_data.obstacles,
         )
         self._publish_zenoh()
@@ -633,57 +628,19 @@ class Simulator:
     def _detect_apriltags(self):
         """Simulate a forward-facing camera detecting AprilTags.
 
-        For each tag in the map, check whether it falls within the camera's
-        horizontal FOV and max range cone.  Detections are published with
-        noisy range/bearing so the pose estimator can anchor its filter.
+        The camera model (FOV cone, range, noise) lives in the configured
+        camera driver; detections are published with noisy range/bearing so the
+        pose estimator can anchor its filter.
         """
-        detections = []
-        max_range_m = CAMERA_MAX_RANGE_M
-        half_fov = CAMERA_FOV_RAD / 2.0
-
-        for tag in self.map_data.apriltags:
-            # Vector from bot to tag in world coordinates.
-            dx = tag.x - self.bot_x
-            dy = tag.y - self.bot_y
-            dist_m = math.hypot(dx, dy)
-            if dist_m > max_range_m:
-                continue
-
-            # Bearing of the tag relative to the bot's forward direction.
-            angle_to_tag = math.atan2(dy, dx)
-            bearing = math.atan2(
-                math.sin(angle_to_tag - self.bot_theta),
-                math.cos(angle_to_tag - self.bot_theta),
-            )
-
-            if abs(bearing) > half_fov:
-                continue
-
-            # Add Gaussian noise to simulate real camera measurement.
-            noisy_range_m = dist_m + random.gauss(0.0, CAMERA_RANGE_NOISE_M)
-            noisy_bearing = bearing + random.gauss(0.0, CAMERA_BEARING_NOISE_RAD)
-
-            # The tag's yaw relative to the camera (used to derive robot pose).
-            # Observed yaw of the tag from the camera's perspective.
-            tag_yaw_in_camera = math.atan2(
-                math.sin(tag.yaw_rad - self.bot_theta),
-                math.cos(tag.yaw_rad - self.bot_theta),
-            )
-            noisy_tag_yaw = tag_yaw_in_camera + random.gauss(0.0, CAMERA_YAW_NOISE_RAD)
-
-            detections.append(
-                {
-                    "id": tag.id,
-                    "range_m": max(0.0, noisy_range_m),
-                    "bearing_rad": noisy_bearing,
-                    "tag_yaw_rad": noisy_tag_yaw,
-                    "tag_size_m": tag.size_m,
-                }
-            )
-
+        detections = self._camera_driver.detect(
+            self.bot_x, self.bot_y, self.bot_theta, self.map_data.apriltags
+        )
         if detections:
             self._pub_camera_apriltag.put(
-                json.dumps({"t": time.time(), "detections": detections})
+                encode(
+                    "sensor/camera/apriltag",
+                    {"t": time.time(), "detections": detections},
+                )
             )
 
     # -----------------------------------------------------------------------
@@ -715,7 +672,7 @@ class Simulator:
         self._chat_active = False
 
         logging.info("Publishing nav/command: %r", text)
-        self._pub_command.put(text)
+        self._pub_command.put(encode_text("nav/command", text))
 
     # -----------------------------------------------------------------------
     # Rendering
@@ -873,8 +830,8 @@ class Simulator:
         Tags within the camera's detection cone are highlighted yellow;
         out-of-range tags are drawn in a muted green.
         """
-        max_range_m = CAMERA_MAX_RANGE_M
-        half_fov = CAMERA_FOV_RAD / 2.0
+        max_range_m = self._camera.max_range_m
+        half_fov = self._camera.fov_rad / 2.0
 
         for tag in self.map_data.apriltags:
             sc = self._world_to_screen((tag.x, tag.y), content_rect, camera, zoom)
@@ -916,8 +873,8 @@ class Simulator:
         bot_screen = self._world_to_screen(
             (self.bot_x, self.bot_y), content_rect, camera, zoom
         )
-        max_range_m = CAMERA_MAX_RANGE_M
-        half_fov = CAMERA_FOV_RAD / 2.0
+        max_range_m = self._camera.max_range_m
+        half_fov = self._camera.fov_rad / 2.0
 
         left_angle = self.bot_theta - half_fov
         right_angle = self.bot_theta + half_fov

@@ -20,7 +20,6 @@ Or:
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 import time
@@ -38,6 +37,8 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 if str(_ZENOH_DIR) not in sys.path:
     sys.path.insert(0, str(_ZENOH_DIR))
+
+from core.messages import SchemaError, decode, encode
 
 
 # Simulated image-processing time per detection (seconds).
@@ -76,11 +77,11 @@ class ApriltagDetector:
     def _process_camera_data(self, sample):
         """Convert polar measurements to Cartesian relative transforms."""
         try:
-            raw = json.loads(sample.payload.to_string())
+            raw = decode("sensor/camera/apriltag", sample)
             raw_tags = raw.get("detections", [])
             source_t = raw.get("t")
-        except (json.JSONDecodeError, Exception) as exc:
-            print(f"[apriltag_detector] Failed to parse camera data: {exc}")
+        except SchemaError as exc:
+            print(f"[apriltag_detector] sensor/camera/apriltag dropped: {exc}")
             return
 
         detections = []
@@ -112,10 +113,10 @@ class ApriltagDetector:
             # detection compute time.
             time.sleep(DETECTION_PROCESSING_S)
 
-            msg = {"detections": detections}
+            fields = {"detections": detections}
             if source_t is not None:
-                msg["t"] = source_t
-            self._pub_detection.put(json.dumps(msg))
+                fields["t"] = source_t
+            self._pub_detection.put(encode("detection/apriltag", fields))
 
     # -----------------------------------------------------------------------
     # Main loop
