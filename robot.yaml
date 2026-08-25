@@ -9,7 +9,7 @@ chassis:                        # body geometry + speed limits (kinematics.py)
   footprint_m: 0.75             # square footprint side length (m)
   wheel_radius_m: 0.12          # wheel radius (m)
   wheel_track_m: 0.69           # drive-wheel separation (m); wheels at corners
-  linear_speed_mps: 3.0         # max commanded linear speed (m/s)
+  linear_speed_mps: 2.0         # max commanded linear speed (m/s)
   angular_speed_rps: 3.0        # max commanded angular speed (rad/s)
   height_m: 0.15                # chassis box height (m)
   mass_kg: 8.0                  # chassis mass (kg)
@@ -61,8 +61,10 @@ physics:                        # sim-only wheel-ground model (simulator.py)
   track_scale_min: 0.85
   track_scale_max: 1.15
   slip_noise: 0.02
-  cross_coupling_rad_per_m: 0.1
+  cross_coupling_rad_per_m: 0.0
   yaw_compensation_rad_per_m: 0.0   # counter the fixed-wheel curve (tune in sim)
+  wheel_friction_mu: 2.0            # wheel-ground grip (PyBullet default 0.5
+                                    # slips when rotating the heavy base+arm)
 
 hardware:                       # T-019 driver selection: which implementation
                                 # backs each device.  "sim" = simulated;

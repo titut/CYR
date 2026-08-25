@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import pybullet as p
 
 from core.map_format import MapData
 from core.robot_config import RobotConfig
+from simulation3d.world import WALL_THICKNESS_M
 
 GRAVITY_Z = -9.81
 
@@ -119,19 +120,40 @@ def detect_apriltags(
     map_data: MapData,
     bot_pose: Tuple[float, float, float],
     cfg: RobotConfig,
+    is_occluded: Optional[Callable[[float, float], bool]] = None,
 ) -> List[dict]:
-    """AprilTag camera: ported 2D FOV-cone logic against the map's tags.
+    """AprilTag camera: 3D-aware FOV cone + line-of-sight detection.
 
-    ``bot_pose`` is the base's (x, y, yaw) ground truth.  Returns the same
-    detection schema as the 2D sim (``{id, range_m, bearing_rad, tag_yaw_rad,
-    tag_size_m}``).
+    ``bot_pose`` is the base's (x, y, yaw) ground truth; the camera sits at the
+    configured mount offset rotated with the base.
+
+    A tag is "printed" on the wall face its ``yaw_rad`` points into, so it is
+    only visible from that side (facing gate).  ``is_occluded(x, y)`` is an
+    optional line-of-sight callback: when provided, a tag whose path from the
+    camera is blocked by a wall/object is not reported, so tags on the far side
+    of a wall no longer inject false pose anchors.
+
+    Returns the same schema as the 2D sim (``{id, range_m, bearing_rad,
+    tag_yaw_rad, tag_size_m}``).
     """
     cam = cfg.sensors.camera
     half_fov = cam.fov_rad / 2.0
     bx, by, btheta = bot_pose
+    mx, my, _ = cam.mount_xyz_m
+    # Camera world xy: base pose + mount offset rotated by the base yaw.
+    cam_x = bx + mx * math.cos(btheta) - my * math.sin(btheta)
+    cam_y = by + mx * math.sin(btheta) + my * math.cos(btheta)
+
     detections: List[dict] = []
     for tag in map_data.apriltags:
-        dx, dy = tag.x - bx, tag.y - by
+        # The tag faces along its yaw_rad; a camera on the opposite side of the
+        # wall is behind the tag and cannot see it.
+        facing_x = math.cos(tag.yaw_rad)
+        facing_y = math.sin(tag.yaw_rad)
+        if (cam_x - tag.x) * facing_x + (cam_y - tag.y) * facing_y <= 0:
+            continue
+
+        dx, dy = tag.x - cam_x, tag.y - cam_y
         dist = math.hypot(dx, dy)
         if dist > cam.max_range_m:
             continue
@@ -139,6 +161,17 @@ def detect_apriltags(
         bearing = _wrap_angle(angle_to_tag - btheta)
         if abs(bearing) > half_fov:
             continue
+
+        # Line of sight.  Probe the tag's printed face itself (exactly on the
+        # wall surface) so the tag's own wall doesn't occlude it, but any
+        # wall/object in between still does.  The probe is horizontal (camera
+        # height), so low floor objects don't block a wall-mounted tag.
+        if is_occluded is not None:
+            sx = tag.x + (WALL_THICKNESS_M / 2.0) * facing_x
+            sy = tag.y + (WALL_THICKNESS_M / 2.0) * facing_y
+            if is_occluded(sx, sy):
+                continue
+
         noisy_range = dist + random.gauss(0.0, cam.range_noise_m)
         noisy_bearing = bearing + random.gauss(0.0, cam.bearing_noise_rad)
         tag_yaw_in_camera = _wrap_angle(tag.yaw_rad - btheta)

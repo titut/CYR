@@ -150,7 +150,10 @@ def generate_base_urdf(cfg: RobotConfig) -> str:
                 f'  <joint name="{name}_joint" type="continuous">',
                 f'    <parent link="{name}_fork"/>',
                 f'    <child link="{name}"/>',
-                f'    <origin xyz="0 0 0" rpy="1.5708 0 0"/>',
+                # Wheel sits behind the fork swivel axis (trail) so the caster
+                # self-aligns and rolls tangentially while turning; a centre-pivot
+                # caster (wheel under the axis) just skids sideways instead.
+                f'    <origin xyz="-0.06 0 0" rpy="1.5708 0 0"/>',
                 f'    <axis xyz="0 0 -1"/>',
                 f'  </joint>',
             ]
@@ -159,13 +162,17 @@ def generate_base_urdf(cfg: RobotConfig) -> str:
     # Corner wheel layout (T3D-01): all four wheels at the base corners,
     # rolling forward (axis along body Y).  The rear pair (x = -corner_x) is
     # driven (fixed wheels); the front pair (x = +corner_x) are swivelling
-    # casters so the base can turn without the wheels scrubbing.
+    # casters so the base can turn without the wheels scrubbing.  Facing +x,
+    # +y is the LEFT side (positive yaw = CCW), so the ``_L`` wheels sit at
+    # +corner_y and ``_R`` at -corner_y.  (This was the wrong way around: the
+    # ``_L``/``_R`` wheels were physically swapped, which inverted every
+    # angular command coming from the drive stack.)
     corner_x = ch.wheelbase_m / 2.0  # front/back wheel x-offset
     corner_y = ch.wheel_track_m / 2.0  # left/right wheel y-offset
-    _wheel_link("wheel_drive_L", -corner_x, -corner_y)  # rear-left  (driven)
-    _wheel_link("wheel_drive_R", -corner_x, corner_y)  # rear-right (driven)
-    _caster_wheel_link("wheel_free_L", corner_x, -corner_y)  # front-left  (caster)
-    _caster_wheel_link("wheel_free_R", corner_x, corner_y)  # front-right (caster)
+    _wheel_link("wheel_drive_L", -corner_x, corner_y)  # rear-left  (driven)
+    _wheel_link("wheel_drive_R", -corner_x, -corner_y)  # rear-right (driven)
+    _caster_wheel_link("wheel_free_L", corner_x, corner_y)  # front-left  (caster)
+    _caster_wheel_link("wheel_free_R", corner_x, -corner_y)  # front-right (caster)
 
     # ---------------- arm mount ----------------
     mount_h = 0.01

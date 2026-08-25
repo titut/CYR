@@ -13,6 +13,7 @@ from control.drive import (
 from core.sim_drivers import _velocity_step
 
 _safety_limit = Drive._safety_limited_linear
+_safety_ang_limit = Drive._safety_limited_angular
 
 
 # ---------------------------------------------------------------------------
@@ -74,3 +75,25 @@ def test_safety_zone_slow_reverse_at_boundary():
 def test_safety_zone_pass_through_when_command_small():
     # A command well below the zone limit passes through unchanged.
     assert _safety_limit(0.2, 0.6) == pytest.approx(0.2)
+
+
+# ---------------------------------------------------------------------------
+# Angular safety cap (T-016)
+# ---------------------------------------------------------------------------
+
+
+def test_safety_angular_full_rate_far_away():
+    assert _safety_ang_limit(3.0, _SLOW_DOWN_CLEARANCE_M + 1.0) == 3.0
+
+
+def test_safety_angular_scales_in_slow_down():
+    # Halfway through the slow-down zone -> roughly half the commanded rate.
+    mid = (_SLOW_DOWN_CLEARANCE_M + _STOP_CLEARANCE_M) / 2.0
+    scale = (mid - _STOP_CLEARANCE_M) / (_SLOW_DOWN_CLEARANCE_M - _STOP_CLEARANCE_M)
+    assert _safety_ang_limit(3.0, mid) == pytest.approx(3.0 * scale)
+
+
+def test_safety_angular_zero_in_stop_zone():
+    # Rotation is halted inside the stop zone (turning could swing into a wall).
+    assert _safety_ang_limit(3.0, _STOP_CLEARANCE_M) == 0.0
+    assert _safety_ang_limit(-3.0, _ESTOP_CLEARANCE_M) == 0.0

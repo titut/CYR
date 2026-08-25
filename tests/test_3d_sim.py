@@ -9,7 +9,7 @@ import pybullet as p
 import pytest
 
 from core.robot_config import load_robot_config
-from simulation3d.simulator import Simulator3D
+from simulation3d.simulator import _ray_ground_intersection, Simulator3D
 
 
 @pytest.fixture()
@@ -74,3 +74,23 @@ def test_teleop_commands_wheels(sim):
     after = sim.truth_pose()
     # The base must not remain perfectly stationary once teleop is applied.
     assert (abs(after[0] - before[0]) + abs(after[2] - before[2])) > 1e-4
+
+
+def test_ray_ground_intersection_basic():
+    # A vertical ray from above the origin lands at (0, 0).
+    assert _ray_ground_intersection([0, 0, 5], [0, 0, 0]) == pytest.approx((0.0, 0.0))
+    # A slanted ray lands where the ground plane actually is (z=0 along the line).
+    assert _ray_ground_intersection([2, 1, 4], [4, 3, 0]) == pytest.approx((4.0, 3.0))
+    # A ray pointing up (camera looking at the sky) has no ground intersection.
+    assert _ray_ground_intersection([0, 0, 1], [0, 0, 2]) is None
+
+
+def test_ray_ground_intersection_consistent_with_ray():
+    # The intersection must lie on the same line as ray_from/ray_to.
+    ray_from = [0.5, -0.5, 3.0]
+    ray_to = [1.0, 0.0, -1.0]
+    gx, gy = _ray_ground_intersection(ray_from, ray_to)
+    # Parametrize the line and check the ground point is on it at z = 0.
+    t = 3.0 / (3.0 - (-1.0))  # z goes 3 -> -1, reach 0 at this fraction
+    assert gx == pytest.approx(0.5 + t * 0.5)
+    assert gy == pytest.approx(-0.5 + t * 0.5)

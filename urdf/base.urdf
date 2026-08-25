@@ -33,7 +33,7 @@
   <joint name="wheel_drive_L_joint" type="continuous">
     <parent link="base_link"/>
     <child link="wheel_drive_L"/>
-    <origin xyz="-0.345 -0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
+    <origin xyz="-0.345 0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
     <axis xyz="0 0 -1"/>
   </joint>
   <link name="wheel_drive_R">
@@ -54,7 +54,7 @@
   <joint name="wheel_drive_R_joint" type="continuous">
     <parent link="base_link"/>
     <child link="wheel_drive_R"/>
-    <origin xyz="-0.345 0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
+    <origin xyz="-0.345 -0.345 -0.07500000000000001" rpy="1.5708 0 0"/>
     <axis xyz="0 0 -1"/>
   </joint>
   <link name="wheel_free_L_fork">
@@ -65,7 +65,7 @@
   <joint name="wheel_free_L_fork_joint" type="continuous">
     <parent link="base_link"/>
     <child link="wheel_free_L_fork"/>
-    <origin xyz="0.345 -0.345 -0.07500000000000001" rpy="0 0 0"/>
+    <origin xyz="0.345 0.345 -0.07500000000000001" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
   </joint>
   <link name="wheel_free_L">
@@ -76,7 +76,7 @@
   <joint name="wheel_free_L_joint" type="continuous">
     <parent link="wheel_free_L_fork"/>
     <child link="wheel_free_L"/>
-    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <origin xyz="-0.06 0 0" rpy="1.5708 0 0"/>
     <axis xyz="0 0 -1"/>
   </joint>
   <link name="wheel_free_R_fork">
@@ -87,7 +87,7 @@
   <joint name="wheel_free_R_fork_joint" type="continuous">
     <parent link="base_link"/>
     <child link="wheel_free_R_fork"/>
-    <origin xyz="0.345 0.345 -0.07500000000000001" rpy="0 0 0"/>
+    <origin xyz="0.345 -0.345 -0.07500000000000001" rpy="0 0 0"/>
     <axis xyz="0 0 1"/>
   </joint>
   <link name="wheel_free_R">
@@ -98,7 +98,7 @@
   <joint name="wheel_free_R_joint" type="continuous">
     <parent link="wheel_free_R_fork"/>
     <child link="wheel_free_R"/>
-    <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+    <origin xyz="-0.06 0 0" rpy="1.5708 0 0"/>
     <axis xyz="0 0 -1"/>
   </joint>
   <link name="arm_mount">

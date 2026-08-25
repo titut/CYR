@@ -61,9 +61,10 @@ def test_teleop_w_commands_forward(sim):
 def test_teleop_a_commands_left_turn(sim):
     sim._keys["a"] = True
     el, er = sim._compute_drive_command()
-    # For this base (rear-drive + front casters), a left turn is left wheel
-    # forward / right wheel back (verified empirically).
-    assert el > 0 > er
+    # A = left turn (CCW): right wheel forward / left wheel back, i.e. the
+    # kinematics convention with the _L/_R wheels on the physically-correct
+    # sides (positive angular = left).
+    assert el < 0 < er
 
 
 def test_wheel_speed_is_preferred_over_teleop(sim):

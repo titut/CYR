@@ -86,6 +86,19 @@ def test_single_scan_ghost_below_threshold():
     assert int(occ.sum()) == 0  # a single inconsistent beam does not stick
 
 
+def test_max_range_no_return_not_an_obstacle():
+    # A beam that returns near the sensor's max range (10 m) means "no return"
+    # — the sim clamps to max range then adds noise, so a no-return reading can
+    # land at e.g. 9.98 m.  That must NOT mark a ghost obstacle at ~10 m.
+    grid, lo = _make_state()
+    rays = [{"angle_rad": math.radians(a), "distance_m": 9.98} for a in range(360)]
+    occ = update_occupancy_log_odds(lo, grid, 5.0, 5.0, 0.0, rays)
+    assert int(occ.sum()) == 0
+    # The free space up to the reading is still cleared.
+    gx, gy = grid.world_to_grid(6.0, 5.0)
+    assert lo[gy, gx] < 0.0
+
+
 def test_occupancy_decays_without_reobservation():
     grid, lo = _make_state()
     cone = math.atan2(1.0, 2.0)

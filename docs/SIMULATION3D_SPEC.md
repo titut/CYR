@@ -340,13 +340,18 @@ walls and objects.
 > **Status (done):** `simulation3d/sensors.py` implements the 3D sensor models —
 > LIDAR via `p.rayTest` (360 rays, 2π, configurable mount height, range noise,
 > robot's own body filtered out), IMU (yaw from base quaternion, gyro bias +
-> noise, proper acceleration = dv/dt − g), and the AprilTag camera (ported 2D
-> FOV-cone against `MapData` tags). The simulator publishes `sensor/lidar`,
-> `sensor/imu` (both 50 Hz) and `sensor/camera/apriltag` (on detection) over
-> zenoh, with the config-driven noise/bias values. Covered by
-> `tests/test_3d_sensors.py`. Note: a horizontal LIDAR at `z=0.2` sees walls
-> (2 m tall) but passes over small floor objects — those are tracked via
-> `object/registry` instead.
+> noise, proper acceleration = dv/dt − g), and the AprilTag camera. The AprilTag
+> camera is 3D-aware: the camera sits at the configured mount, each tag is
+> "printed" on the wall face its `yaw_rad` points into and is only visible from
+> that side (facing gate), and an optional line-of-sight check (`p.rayTest`,
+> robot self-hits ignored) drops tags blocked by a wall/object — so tags on the
+> far side of a wall no longer inject false pose anchors. The simulator
+> publishes `sensor/lidar`, `sensor/imu` (both 50 Hz) and
+> `sensor/camera/apriltag` (on detection) over zenoh, with the config-driven
+> noise/bias values. `home.json` tag yaws were fixed so every tag faces into the
+> adjacent room. Covered by `tests/test_3d_sensors.py`. Note: a horizontal LIDAR
+> at `z=0.2` sees walls (2 m tall) but passes over small floor objects — those
+> are tracked via `object/registry` instead.
 
 ---
 
@@ -393,6 +398,36 @@ odometry drift vs truth the same way it did in 2D.
 > now swivelling casters (T3D-01). Some traction/speed wobble remains in raw
 > PyBullet, but the base is usable. The 2D sim remains the navigation-accuracy
 > reference.
+>
+> **Goal-setting + estimator overlay (GUI):** left-clicking the ground in the
+> `--gui` viewer publishes `nav/goal` (raycast through the PyBullet camera to
+> the z=0 plane), so the unchanged navigator/controller/drive stack can drive
+> the base to the click point. A debug overlay (toggle with **G**) draws the
+> ground-truth pose (green arrow), the pose estimator's guess (red arrow, from
+> `estimate/pose`), the planned `nav/path` (blue) and the current goal (yellow
+> X). The pose estimator's running value can also be watched live with
+> `python3 zenoh/topic_view.py estimate/pose` and compared against
+> `sim/truth/pose`.
+>
+> **End-to-end nav verified (headless):** with the unmodified stack
+> (drive/controller/pose_est/navigator) running against the 3D sim, publishing
+> a `nav/goal` (6, 6.5) from spawn (8, 8.5) makes the robot turn to face it and
+> drive to the goal, stopping within ~0.6 m (controller `GOAL_RADIUS_M` 0.3 +
+> ~0.15 m estimator offset + path-end offset). This surfaced and fixed two real
+> bugs:
+>   1. **Swapped drive wheels** — `wheel_drive_L`/`wheel_drive_R` were attached
+>      to the physically-opposite sides (`_L` at −y = the *right* wheel facing
+>      +x), so every angular command was inverted and the robot drove *away*
+>      from the goal. The URDF now places `_L` at +y / `_R` at −y, and the
+>      teleop sign that compensated for the inversion was removed.
+>   2. **Wheel traction** — PyBullet's default lateral friction (0.5) let the
+>      drive wheels slip when rotating the heavy base+arm, so the base skidded
+>      sideways instead of turning (and hit walls). `physics.wheel_friction_mu`
+>      (default 2.0) is applied to all base links via `changeDynamics`.
+> The pose estimator converges against the 3D LIDAR/IMU/AprilTags (est≈truth
+> within ~0.1–0.2 m). Remaining gap to the 0.2 m "done when" bar is the
+> estimator offset + controller arrival radius; both are shared with the 2D
+> stack.
 
 ---
 

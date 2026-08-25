@@ -8,7 +8,7 @@ Builds the base + arm + world, runs a deterministic fixed-step physics loop
                  object/registry  — current object poses every 1 s
     Subscribes:  (none yet; wheel-speed + arm topics come in T3D-06/08)
 
-Headless (DIRECT) by default; ``--gui`` opens the PyBullet viewer with WASD
+Headless (DIRECT) by default; ``--gui`` opens the PyBullet viewer with arrow-key
 teleop (drive), 1/2/3 camera modes, ESC to quit.
 """
 
@@ -59,6 +59,9 @@ WHEEL_TIMEOUT_S = 0.2
 # Teleop acceleration ramp: standalone teleop jumps to full speed instantly,
 # which pitches the base forward (arm up).  These cap how fast it accelerates.
 _TELEOP_DT = 1.0 / LOOP_HZ
+# Teleop ramps the velocity up gently so the base doesn't lunge to full speed
+# (which pitches the high-COM arm base).  With the casters rolling freely the
+# base stays level, so this ramp is just for comfort, not stability.
 _TELEOP_ACCEL_MPS2 = 1.2  # linear accel cap (m/s²)
 _TELEOP_ANG_ACCEL_RPS2 = 2.0  # angular accel cap (rad/s²)
 
@@ -72,6 +75,60 @@ def _ramp(current: float, target: float, max_step: float) -> float:
     if current < target:
         return min(target, current + max_step)
     return max(target, current - max_step)
+
+
+def _mouse_ray(x: float, y: float) -> tuple[list, list]:
+    """World-space ray under a GUI pixel click (official PyBullet getRayFromTo
+    formulation).  ``x``/``y`` are PyBullet mouse coords (top-left origin)."""
+    cam = p.getDebugVisualizerCamera()
+    width, height = cam[0], cam[1]
+    cam_forward, horizon, vertical = cam[5], cam[6], cam[7]
+    dist, cam_target = cam[10], cam[11]
+    cam_pos = [
+        cam_target[0] - dist * cam_forward[0],
+        cam_target[1] - dist * cam_forward[1],
+        cam_target[2] - dist * cam_forward[2],
+    ]
+    ray_forward = [cam_target[i] - cam_pos[i] for i in range(3)]
+    inv_len = 10000.0 / math.sqrt(sum(c * c for c in ray_forward))
+    ray_forward = [c * inv_len for c in ray_forward]
+    d_hor = [c / width for c in horizon]
+    d_ver = [c / height for c in vertical]
+    ray_to = [
+        cam_pos[i] + ray_forward[i] - 0.5 * horizon[i] + 0.5 * vertical[i]
+        + x * d_hor[i] - y * d_ver[i]
+        for i in range(3)
+    ]
+    return cam_pos, ray_to
+
+
+def _ray_ground_intersection(ray_from, ray_to):
+    """Where the ray crosses the ground plane z=0 -> (x, y), or None when the
+    ray does not point downward (no ground in view)."""
+    dx = ray_to[0] - ray_from[0]
+    dy = ray_to[1] - ray_from[1]
+    dz = ray_to[2] - ray_from[2]
+    if dz >= 0:
+        return None
+    t = -ray_from[2] / dz
+    return (ray_from[0] + t * dx, ray_from[1] + t * dy)
+
+
+def _arrow(x: float, y: float, theta: float, length: float, color):
+    """Debug-line arrow at (x, y) heading theta (rad, CCW from +X)."""
+    items = []
+    dx, dy = length * math.cos(theta), length * math.sin(theta)
+    base = (x, y, 0.05)
+    tip = (x + dx, y + dy, 0.05)
+    items.append(p.addUserDebugLine(base, tip, color))
+    back = (x + dx * 0.6, y + dy * 0.6, 0.05)
+    px, py = -dy, dx
+    norm = math.hypot(px, py) or 1.0
+    s = 0.06 * length / (length or 1.0)
+    px, py = px / norm * s, py / norm * s
+    items.append(p.addUserDebugLine(tip, [back[0] + px, back[1] + py, 0.05], color))
+    items.append(p.addUserDebugLine(tip, [back[0] - px, back[1] - py, 0.05], color))
+    return items
 
 
 class Simulator3D:
@@ -152,6 +209,10 @@ class Simulator3D:
         self._camera_mode = 0
         self._teleop_lin = 0.0
         self._teleop_ang = 0.0
+        # GUI rendering is expensive: resetting the camera and re-adding every
+        # debug overlay line each frame is what pushes the loop below 60 Hz
+        # (and the whole sim into slow motion).  Throttle both.
+        self._last_gui_t = 0.0
 
         # ---- drive state (T3D-06) ----
         phy = self._cfg.physics
@@ -164,6 +225,10 @@ class Simulator3D:
         self._est_pose: tuple[float, float, float] | None = None
         self._nav_path: list = []
         self._detected: list = []
+        # Click-to-goal (GUI) + debug overlay of the nav stack's guess.
+        self._nav_goal: tuple[float, float] | None = None
+        self._overlay = True
+        self._debug_items: list[int] = []
 
         # ---- sensor state (T3D-05) ----
         imu = self._cfg.sensors.imu
@@ -206,6 +271,11 @@ class Simulator3D:
                 congestion_control=zenoh.CongestionControl.DROP,
                 reliability=zenoh.Reliability.BEST_EFFORT,
             )
+            self._pub_goal = self._session.declare_publisher(
+                "nav/goal",
+                congestion_control=zenoh.CongestionControl.DROP,
+                reliability=zenoh.Reliability.BEST_EFFORT,
+            )
 
             # Drive + nav-stack subscriptions (T3D-06).
             self._sub_wheel = self._session.declare_subscriber(
@@ -220,6 +290,9 @@ class Simulator3D:
             self._sub_detection = self._session.declare_subscriber(
                 "detection/obstacles", self._on_detection
             )
+            self._sub_goal = self._session.declare_subscriber(
+                "nav/goal", self._on_nav_goal
+            )
 
         # Let the base settle onto the wheels (and the arm onto the mount).
         for _ in range(240 * 2):
@@ -233,25 +306,38 @@ class Simulator3D:
                 cameraDistance=3.0, cameraYaw=45, cameraPitch=-30,
                 cameraTargetPosition=[bx, by, 0.2],
             )
+            # On machines without GPU-accelerated GL each stepSimulation render
+            # costs ~17 ms — the whole 60 Hz budget — so rendering every frame
+            # starves the physics.  Disable per-step rendering; the main loop
+            # re-enables it for a frame ~30 Hz to refresh the view.
+            p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
 
     # ------------------------------------------------------------------
     # Wheel friction (driving is refined in T3D-06)
     # ------------------------------------------------------------------
 
     def _setup_wheel_friction(self):
-        # Reasonable defaults so teleop works at all.  Driving quality (traction,
-        # slip realism, straight-line tracking) is tuned in T3D-06.
+        # PyBullet's default lateral friction (0.5) lets the drive wheels slip
+        # when rotating the heavy base+arm, so the base skids sideways instead
+        # of turning.  physics.wheel_friction_mu (~2.0) grips well; much higher
+        # becomes numerically unstable.
+        #
+        # The high mu is applied ONLY to the driven wheels.  The free casters
+        # get low friction: with the arm making the base front-heavy, the front
+        # casters are heavily loaded, and the same 2.0 grip makes them scrub
+        # instead of swivelling/rolling — they dig in and pitch the driven rear
+        # wheels off the ground (rear-up "stoppie"), killing traction.
+        mu = self._cfg.physics.wheel_friction_mu
         for j in range(p.getNumJoints(self._base)):
-            name = p.getJointInfo(self._base, j)[12].decode()
-            if name.startswith("wheel_drive"):
+            if "free" in p.getJointInfo(self._base, j)[1].decode():
                 p.changeDynamics(
                     self._base, j,
-                    lateralFriction=3.0, spinningFriction=0.3, rollingFriction=0.02,
+                    lateralFriction=0.2, spinningFriction=0.01, rollingFriction=0.005,
                 )
-            elif name.startswith("wheel_free"):
+            else:
                 p.changeDynamics(
                     self._base, j,
-                    lateralFriction=1.0, spinningFriction=0.1, rollingFriction=0.02,
+                    lateralFriction=mu, spinningFriction=0.1, rollingFriction=0.02,
                 )
 
     # ------------------------------------------------------------------
@@ -324,10 +410,11 @@ class Simulator3D:
             )
         else:
             target_lin = (self._keys["w"] - self._keys["s"]) * ch.linear_speed_mps
-            # A = turn left (CCW, +yaw).  With the corrected wheel axis (positive
-            # spin = forward) the physical turn is opposite the command, so the
-            # angular term is negated here.
-            target_ang = (self._keys["d"] - self._keys["a"]) * ch.angular_speed_rps
+            # Left arrow = turn left (CCW, +yaw), right arrow = turn right.  With
+            # the corrected wheel-axis and the _L/_R wheels on the
+            # physically-correct sides, the kinematics convention (positive
+            # angular = left) holds here.
+            target_ang = (self._keys["a"] - self._keys["d"]) * ch.angular_speed_rps
             # Ramp the teleop velocity so the base doesn't lunge to full speed
             # instantly (which makes it pitch forward with the arm up).
             self._teleop_lin = _ramp(self._teleop_lin, target_lin, _TELEOP_ACCEL_MPS2 * _TELEOP_DT)
@@ -385,34 +472,120 @@ class Simulator3D:
         except SchemaError:
             pass
 
+    def _on_nav_goal(self, sample):
+        try:
+            data = decode("nav/goal", sample)
+            self._nav_goal = (float(data["x_m"]), float(data["y_m"]))
+        except SchemaError:
+            pass
+
+    def _set_goal_from_click(self, x: float, y: float):
+        """Turn a GUI left-click on the ground into a nav/goal publication."""
+        goal = _ray_ground_intersection(*_mouse_ray(x, y))
+        if goal is None:
+            return
+        self._nav_goal = goal
+        if self._session is not None:
+            self._pub_goal.put(encode("nav/goal", {"x_m": goal[0], "y_m": goal[1]}))
+        print(f"[sim3d] nav/goal -> ({goal[0]:.2f}, {goal[1]:.2f})")
+
+    def _draw_overlay(self):
+        """Debug overlay of the nav stack's state: truth (green arrow),
+        pose-estimator guess (red arrow), planned path (blue) and the goal
+        (yellow X).  Toggle with the G key.
+
+        On machines without GPU-accelerated PyBullet GL (Mesa software
+        rendering) each debug line costs ~30 ms to add/remove, so re-drawing
+        them every frame is what drops the GUI loop below 60 Hz.  Redraw is
+        throttled to ~4 Hz and the nav path is downsampled.
+        """
+        if not self._gui:
+            return
+        now = time.monotonic()
+        if now - self._last_gui_t < 0.25:
+            return
+        self._last_gui_t = now
+        for uid in self._debug_items:
+            p.removeUserDebugItem(uid)
+        self._debug_items = []
+        if not self._overlay:
+            return
+        if self._nav_goal is not None:
+            gx, gy = self._nav_goal
+            s = 0.12
+            c = [0.95, 0.75, 0.05]
+            self._debug_items.append(
+                p.addUserDebugLine([gx - s, gy - s, 0.06], [gx + s, gy + s, 0.06], c)
+            )
+            self._debug_items.append(
+                p.addUserDebugLine([gx - s, gy + s, 0.06], [gx + s, gy - s, 0.06], c)
+            )
+        if len(self._nav_path) >= 2:
+            pts = self._nav_path
+            if len(pts) > 16:
+                step = (len(pts) - 1) / 15
+                idx = [int(round(i * step)) for i in range(16)]
+                idx.append(len(pts) - 1)
+                pts = [pts[i] for i in sorted(set(idx))]
+            tri = [(px, py, 0.04) for px, py in pts]
+            for a, b in zip(tri[:-1], tri[1:]):
+                self._debug_items.append(p.addUserDebugLine(a, b, [0.25, 0.45, 1.0]))
+        x, y, th = self.truth_pose()
+        self._debug_items.extend(_arrow(x, y, th, 0.35, [0.1, 0.8, 0.1]))
+        if self._est_pose is not None:
+            ex, ey, eth = self._est_pose
+            self._debug_items.extend(_arrow(ex, ey, eth, 0.35, [0.9, 0.1, 0.1]))
+
     def _read_keyboard_gui(self) -> bool:
-        """Update teleop keys from the PyBullet GUI.  Returns False on ESC."""
+        """Update teleop keys from the PyBullet GUI.  Returns False on ESC.
+        Drive with the arrow keys (WASD is reserved by the PyBullet viewer);
+        left-click on the ground sets a nav/goal; G toggles the overlay."""
         for key, state in p.getKeyboardEvents().items():
             down = (state & p.KEY_IS_DOWN) != 0
-            if key == ord("w"):
+            if key == p.B3G_UP_ARROW:
                 self._keys["w"] = down
-            elif key == ord("a"):
+            elif key == p.B3G_LEFT_ARROW:
                 self._keys["a"] = down
-            elif key == ord("s"):
+            elif key == p.B3G_DOWN_ARROW:
                 self._keys["s"] = down
-            elif key == ord("d"):
+            elif key == p.B3G_RIGHT_ARROW:
                 self._keys["d"] = down
             elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
                 self._camera_mode = key - ord("1")
+            elif key == ord("g"):
+                if down:
+                    self._overlay = not self._overlay
             elif key == p.B3G_ESCAPE:
                 return False
+        # Mouse events are (event_type, x, y, button, state); a left-click press
+        # is event_type=2, button=0 with the trigger+down flags set.
+        for evt, x, y, btn, state in p.getMouseEvents():
+            if (
+                evt == 2
+                and btn == 0
+                and (state & p.KEY_WAS_TRIGGERED)
+                and (state & p.KEY_IS_DOWN)
+            ):
+                self._set_goal_from_click(x, y)
         return True
 
     def _update_camera(self):
         """GUI camera: 0 = follow base (preserve orbit), 1 = top-down,
-        2 = arm end-effector, 3 = free (user orbits)."""
+        2 = arm end-effector, 3 = free (user orbits).  Throttled to ~10 Hz;
+        resetDebugVisualizerCamera every frame is expensive."""
+        if time.monotonic() - self._last_gui_t < 0.1:
+            return
         if self._camera_mode == 0:
             # Follow the base: keep the user's current distance/yaw/pitch but
             # re-centre on the base so it doesn't drive out of frame (which also
             # avoided the "see-through" clipping as the camera never ends up
             # inside a body).
             cam = p.getDebugVisualizerCamera()
-            distance, yaw, pitch = cam[8], cam[9], cam[10]
+            # getDebugVisualizerCamera: [8]=yaw, [9]=pitch, [10]=distance,
+            # [11]=target.  Keep the user's current orbit but re-centre on the
+            # base so it doesn't drive out of frame (which also avoided the
+            # "see-through" clipping as the camera never ends up inside a body).
+            yaw, pitch, distance = cam[8], cam[9], cam[10]
             pos = p.getBasePositionAndOrientation(self._base)[0]
             p.resetDebugVisualizerCamera(
                 cameraDistance=distance, cameraYaw=yaw, cameraPitch=pitch,
@@ -450,7 +623,11 @@ class Simulator3D:
         self._pub_truth.put(
             encode("sim/truth/pose", {"t": now, "x_m": x, "y_m": y, "theta_rad": theta})
         )
-        self._pub_wasd.put(encode("sensor/wasd", self._keys))
+        # The sim's own keyboard only exists in GUI mode; headless, the teleop
+        # keys come from the viewer (zenoh/sim_viewer.py), which publishes
+        # sensor/wasd here so there is a single publisher.
+        if self._gui:
+            self._pub_wasd.put(encode("sensor/wasd", self._keys))
 
         if now - getattr(self, "_last_registry_t", 0.0) >= 1.0 / REGISTRY_HZ:
             self._last_registry_t = now
@@ -482,7 +659,32 @@ class Simulator3D:
         self._pub_imu.put(imu_msg)
 
         if self._map is not None:
-            dets = detect_apriltags(self._map, bot_pose, self._cfg)
+            # Camera at the configured mount, rotated with the base.
+            pos, orn = p.getBasePositionAndOrientation(self._base)
+            yaw = p.getEulerFromQuaternion(orn)[2]
+            mx, my, mz = self._cfg.sensors.camera.mount_xyz_m
+            cam_pos = (
+                pos[0] + mx * math.cos(yaw) - my * math.sin(yaw),
+                pos[1] + mx * math.sin(yaw) + my * math.cos(yaw),
+                pos[2] + mz,
+            )
+            robot = {self._base, self._arm}
+
+            def is_occluded(sx: float, sy: float) -> bool:
+                """True if a wall/object blocks the camera's line of sight to
+                the tag's printed face (robot self-hits ignored).  The probe
+                point lies on the tag's own wall face, so a hit essentially at
+                the endpoint is the tag's wall and does not count."""
+                to = (sx, sy, cam_pos[2])
+                for hit in p.rayTest(cam_pos, to):
+                    if hit[0] < 0 or hit[0] in robot:
+                        continue
+                    return hit[2] < 0.98
+                return False
+
+            dets = detect_apriltags(
+                self._map, bot_pose, self._cfg, is_occluded=is_occluded
+            )
             if dets:
                 self._pub_camera.put(
                     encode("sensor/camera/apriltag", {"t": t, "detections": dets})
@@ -496,13 +698,26 @@ class Simulator3D:
         running = True
         next_tick = time.monotonic()
         period = 1.0 / LOOP_HZ
+        frame = 0
         try:
             while running:
                 if self._gui:
                     running = self._read_keyboard_gui()
                     self._update_camera()
-                self.step()
+                    self._draw_overlay()
+                    # Physics steps every frame; the ~17 ms GL render only runs
+                    # every other frame (~30 Hz refresh) so it can't starve the
+                    # physics loop.
+                    if frame % 2 == 0:
+                        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+                        self.step()
+                        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
+                    else:
+                        self.step()
+                else:
+                    self.step()
                 self._publish()
+                frame += 1
                 next_tick += period
                 sleep_until(next_tick)
         finally:

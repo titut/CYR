@@ -15,10 +15,17 @@ It also implements a layered safety response (T-016) keyed on the minimum
 body-to-surface clearance (from LIDAR, each ray minus the square footprint at
 that angle):
 
-    slow_down zone  (< 1.0 m)   linear speed is scaled down with distance
-    stop zone       (< 0.15 m)  forward motion is halted (slow reverse allowed)
+    slow_down zone  (< 1.0 m)   linear speed scaled down with distance, and the
+                                angular rate capped the same way (turning hard
+                                next to a wall can swing the body into it)
+    stop zone       (< 0.15 m)  forward motion and rotation halted (slow
+                                reverse allowed)
     latched e-stop  (< 0.05 m)  wheels held at zero until an explicit
-                                safety/reset — never auto-cleared
+                                safety/reset — never auto-cleared.  After a
+                                reset, a slow reverse is still allowed so the
+                                robot can back OUT of the hazard (it would
+                                otherwise instantly re-latch and be stuck);
+                                any forward/rotational command re-latches.
 
 On hardware, the stop tier is the safety function and the latched e-stop is its
 safe state; both belong on a safety-rated channel (IEC 61508 / ISO 3691-4)
@@ -171,8 +178,14 @@ class Drive:
             self._min_clearance_m = min_clearance
 
     def _on_reset(self, sample):
-        """Clear a latched e-stop.  The command is zeroed so the robot does not
-        lurch back onto the command that caused the stop."""
+        """Clear a latched e-stop.
+
+        The command is NOT zeroed: if the operator is holding reverse the next
+        step applies it immediately to back out of the hazard (the e-stop
+        threshold check only re-latches on forward/rotational commands).  If the
+        pending command is forward, it re-latches — still unsafe, so nothing
+        lurches into the wall.
+        """
         try:
             decode_text("safety/reset", sample)
         except SchemaError as exc:
@@ -182,8 +195,6 @@ class Drive:
             if self._estop_latched:
                 self._estop_latched = False
                 print("[drive] E-STOP cleared by safety/reset.")
-            self._cmd_linear = 0.0
-            self._cmd_angular = 0.0
 
     @staticmethod
     def _safety_limited_linear(
@@ -214,6 +225,31 @@ class Drive:
         # stop zone
         if linear < 0:
             return max(linear, -reverse_escape_mps)
+        return 0.0
+
+    @staticmethod
+    def _safety_limited_angular(
+        angular: float,
+        clearance: float,
+        slow_down_clearance_m: float = _SLOW_DOWN_CLEARANCE_M,
+        stop_clearance_m: float = _STOP_CLEARANCE_M,
+    ) -> float:
+        """Cap the commanded angular rate by proximity to a surface.
+
+        Above the slow-down zone the command passes through.  Inside it the
+        rate is scaled linearly down to zero at the stop boundary (turning at
+        full rate next to a wall can swing the body into it), and rotation is
+        halted in the stop zone.  Zone boundaries come from the robot config
+        (defaults = nominal robot).
+        """
+        if clearance >= slow_down_clearance_m:
+            return angular
+        if clearance > stop_clearance_m:
+            scale = (
+                (clearance - stop_clearance_m)
+                / (slow_down_clearance_m - stop_clearance_m)
+            )
+            return angular * scale
         return 0.0
 
     def _publish_status(self, state: str):
@@ -255,8 +291,25 @@ class Drive:
             self._publish_status("estop_latched")
             return
 
-        # Body edge inside the e-stop threshold: latch it.
+        # Body edge inside the e-stop threshold: latch it.  A slow reverse is
+        # still allowed so the robot can back OUT of the hazard — e.g. right
+        # after a safety/reset the robot is still within the threshold, and
+        # without this it would instantly re-latch and be stuck against the
+        # surface.  Any forward or rotational command re-latches.
         if min_clearance_m < self._estop_clearance_m:
+            if linear < 0.0:
+                linear = max(linear, -self._reverse_escape_mps)
+                angular = 0.0
+                self._driver.set_command(linear, angular)
+                left, right = self._driver.step(dt)
+                self._pub_wheel.put(
+                    encode(
+                        "sensor/wheel_speed",
+                        {"left_rps": left, "right_rps": right, "t": time.time()},
+                    )
+                )
+                self._publish_status("stop")
+                return
             with self._lock:
                 self._estop_latched = True
             print(
@@ -274,7 +327,9 @@ class Drive:
             self._publish_status("estop_latched")
             return
 
-        # Slow-down / stop zones: scale the linear command by proximity.
+        # Slow-down / stop zones: scale the linear command by proximity, and
+        # cap the angular rate the same way (turning hard next to a wall can
+        # swing the body into it).
         linear = self._safety_limited_linear(
             linear,
             min_clearance_m,
@@ -282,6 +337,12 @@ class Drive:
             stop_clearance_m=self._stop_clearance_m,
             max_speed_mps=self._max_speed_mps,
             reverse_escape_mps=self._reverse_escape_mps,
+        )
+        angular = self._safety_limited_angular(
+            angular,
+            min_clearance_m,
+            slow_down_clearance_m=self._slow_down_clearance_m,
+            stop_clearance_m=self._stop_clearance_m,
         )
 
         # Command the configured drive driver (sim/logging/...) and read the

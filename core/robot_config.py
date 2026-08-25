@@ -147,6 +147,12 @@ class PhysicsConfig:
     # of forward travel (a traction artefact).  A positive value adds an opposing
     # angular velocity when driving straight, so W/S actually go forward/back.
     yaw_compensation_rad_per_m: float = 0.0
+    # Wheel-ground lateral friction coefficient (PyBullet changeDynamics
+    # lateralFriction on every wheel/caster link).  PyBullet's default (0.5)
+    # lets the drive wheels slip when rotating the heavy base+arm, so the base
+    # skids sideways instead of turning.  1.5-2.0 turns reliably; much higher
+    # becomes numerically unstable.
+    wheel_friction_mu: float = 2.0
 
 
 @dataclass

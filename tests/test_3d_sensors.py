@@ -11,11 +11,24 @@ import pybullet as p
 import pybullet_data
 import pytest
 
-from core.map_format import MapData
+from core.map_format import Apriltag, MapData, Metadata
 from core.messages import SchemaError, decode
 from core.robot_config import load_robot_config
 from simulation3d.sensors import detect_apriltags, read_imu, scan_lidar
 from simulation3d.world import _spawn_wall_box
+
+
+def _point_in_polygon(x: float, y: float, polygon) -> bool:
+    inside = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        if ((y1 > y) != (y2 > y)) and (
+            x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1
+        ):
+            inside = not inside
+    return inside
 
 
 @pytest.fixture()
@@ -102,6 +115,61 @@ def test_apriltag_camera_detects_map_tags():
     for d in dets:
         for field in ("id", "range_m", "bearing_rad", "tag_yaw_rad", "tag_size_m"):
             assert field in d
+
+
+def test_apriltag_facing_gate_side():
+    # A tag printed on a wall faces along its yaw_rad; a camera on that side
+    # sees it, a camera on the opposite side (its back) does not.
+    cfg = load_robot_config()
+    map_data = MapData(
+        metadata=Metadata(scale_m_per_px=0.01, size_m=(20.0, 20.0)),
+        apriltags=[Apriltag(id=0, x=5.0, y=0.0, yaw_rad=0.0)],  # faces +x (east)
+    )
+    # Camera EAST of the tag, looking west toward it -> front of the tag.
+    front = detect_apriltags(map_data, (7.0, 0.0, math.pi), cfg)
+    assert any(d["id"] == 0 for d in front)
+    # Camera WEST of the tag, looking east -> behind it, not visible.
+    back = detect_apriltags(map_data, (3.0, 0.0, 0.0), cfg)
+    assert not any(d["id"] == 0 for d in back)
+
+
+def test_apriltag_occlusion_blocks_tag(direct):
+    cfg = load_robot_config()
+    map_data = MapData(
+        metadata=Metadata(scale_m_per_px=0.01, size_m=(20.0, 20.0)),
+        apriltags=[Apriltag(id=0, x=7.0, y=0.0, yaw_rad=math.pi)],  # faces west
+    )
+    cam_pos = (3.0, 0.0, 0.545)  # camera at the base mount height
+    robot_bodies = set()
+
+    def occluded(sx, sy):
+        for hit in p.rayTest(cam_pos, (sx, sy, cam_pos[2])):
+            if hit[0] < 0 or hit[0] in robot_bodies:
+                continue
+            return hit[2] < 0.98  # non-robot body clearly before the tag face
+        return False
+
+    # Clear line of sight -> tag is detected.
+    dets = detect_apriltags(map_data, (3.0, 0.0, 0.0), cfg, is_occluded=occluded)
+    assert any(d["id"] == 0 for d in dets)
+    # A wall between the camera and the tag blocks it.
+    _spawn_wall_box(5.0, -1.0, 5.0, 1.0)
+    dets = detect_apriltags(map_data, (3.0, 0.0, 0.0), cfg, is_occluded=occluded)
+    assert not any(d["id"] == 0 for d in dets)
+
+
+def test_home_json_tag_yaws_face_rooms():
+    # Every tag should be printed on the side that faces into a room, so the
+    # facing gate keeps the tags usable.
+    map_data = MapData.from_json("home.json")
+    for tag in map_data.apriltags:
+        fx = math.cos(tag.yaw_rad)
+        fy = math.sin(tag.yaw_rad)
+        px = tag.x + 1.0 * fx
+        py = tag.y + 1.0 * fy
+        assert any(
+            _point_in_polygon(px, py, room.polygon) for room in map_data.rooms
+        ), f"tag {tag.id} at ({tag.x},{tag.y}) does not face into a room"
 
 
 def test_lidar_message_schema(base_arm):

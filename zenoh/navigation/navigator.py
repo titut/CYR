@@ -69,6 +69,14 @@ _LO_MAX = 3.0             # log-odds clamp; a few consistent hits saturate
 _LO_OCCUPIED = 0.7        # cell counts as occupied above this
 _LO_DECAY = 0.05          # per-update pull toward 0 so stale cells fade
 
+# A LIDAR beam that returns near the sensor's max range means "no return" —
+# there is nothing there, just nothing within range.  The sim clamps to
+# max_range and then adds noise, so a "no return" reading lands at
+# max_range ± noise (e.g. 9.98 m) and would otherwise be marked occupied as a
+# ghost obstacle at ~10 m.  Only treat a reading as a real hit if it is well
+# inside the range (this margin ≈ 5× the 0.02 m range noise).
+_MAX_RANGE_MARGIN_M = 0.1
+
 _CHECK_INTERVAL_S = 0.25  # how often to scan and (maybe) replan
 
 
@@ -114,8 +122,9 @@ def update_occupancy_log_odds(
                 if not grid.grid[gy, gx]:
                     lo[gy, gx] -= _LO_FREE_DEC
 
-        # The hit cell itself is occupied — unless it is a known wall.
-        if dist < max_range_m:
+        # The hit cell itself is occupied — unless it is a known wall, or the
+        # reading is a "no return" near max range (treated as free space only).
+        if dist < max_range_m - _MAX_RANGE_MARGIN_M:
             if 0 <= gx1 < grid.cols and 0 <= gy1 < grid.rows:
                 if not grid.grid[gy1, gx1]:
                     lo[gy1, gx1] += _LO_OCCUPIED_INC
