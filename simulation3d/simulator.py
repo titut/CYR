@@ -651,7 +651,7 @@ class Simulator3D:
             )
         )
         imu = read_imu(self._base, self._cfg, self._gyro_bias_rps, self._prev_lin_vel, dt)
-        self._prev_lin_vel = tuple(p.getBaseVelocity(self._base)[1])
+        self._prev_lin_vel = tuple(p.getBaseVelocity(self._base)[0])
         imu_msg = encode(
             "sensor/imu",
             {"t": t, "pitch_rad": 0.0, "roll_rad": 0.0, **imu},

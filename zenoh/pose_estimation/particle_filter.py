@@ -75,8 +75,8 @@ class ParticleFilter:
         lambda_short: float = 2.0,
         odom_scale_init_std: float = 0.1,
         odom_scale_roughen_std: float = 0.01,
-        odom_scale_min: float = 0.5,
-        odom_scale_max: float = 1.5,
+        odom_scale_min: float = 0.9,
+        odom_scale_max: float = 1.1,
     ):
         self.map_data = map_data
         self.num_particles = num_particles
@@ -330,6 +330,33 @@ class ParticleFilter:
         if delta_forward_m != 0.0 or delta_theta != 0.0:
             self.predict(delta_forward_m, delta_theta)
         return False
+
+    def snap_absolute(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        std_xy_m: float,
+        std_theta_rad: float,
+    ) -> None:
+        """Hard-correction: re-seed the whole cloud tightly around an absolute
+        pose measurement (e.g. an AprilTag fix) and reset to uniform weights.
+
+        An AprilTag reading is authoritative when available — unlike
+        ``fuse_absolute_pose`` (a gentle Bayesian re-weighting that keeps the
+        current belief), this makes the estimate *be* the measurement.  A small
+        std keeps the cloud consistent with the measurement's own uncertainty
+        instead of overfitting a single noisy reading, and the uniform weights
+        mean the very next weak LIDAR scan cannot wash the fix out.
+        """
+        self.anchor_fraction(
+            x,
+            y,
+            theta,
+            std_xy_m=std_xy_m,
+            std_theta_rad=std_theta_rad,
+            fraction=1.0,
+        )
 
     def _inside_wall(self, x: float, y: float) -> bool:
         """Rough check whether a point is inside a wall buffer (not used with rooms)."""

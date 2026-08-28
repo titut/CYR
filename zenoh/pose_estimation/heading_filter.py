@@ -37,6 +37,10 @@ class HeadingFilter:
         yaw_noise_rad: float = 0.1,
         bias_process_noise_rps: float = 0.001,
         track_process_noise: float = 0.001,
+        gyro_bias_max_rps: float = 0.02,
+        track_scale_min: float = 0.9,
+        track_scale_max: float = 1.1,
+        odom_slip_threshold_rps: float = 0.5,
     ):
         # State: [heading (rad), gyro_bias (rad/s), track_scale (dimensionless)].
         self.x = np.array([initial_heading, 0.0, 1.0], dtype=np.float64)
@@ -51,6 +55,21 @@ class HeadingFilter:
         self.yaw_noise = yaw_noise_rad
         self.bias_process_noise = bias_process_noise_rps
         self.track_process_noise = track_process_noise
+        # Physical bounds: these calibration parameters are near-constant and
+        # near unity in reality (the sim's gyro bias is ±0.005 rad/s, its track
+        # scale within ~±5%).  They are only loosely observable in open space,
+        # so without tight bounds they random-walk and corrupt the heading (the
+        # gyro bias alone was observed swinging to ±0.38 rad/s, causing 20-70°
+        # of heading drift).  Clamp them to their physical range.
+        self.gyro_bias_max_rps = gyro_bias_max_rps
+        self.track_scale_min = track_scale_min
+        self.track_scale_max = track_scale_max
+        # Wheel-slip gate: when the wheel-derived angular rate disagrees with
+        # the gyro by more than this, the wheels are slipping (the sim's base
+        # under-rotates during in-place turns, so the wheel rate can be ~2x the
+        # true rate).  In that case the odometry rate is not fused — the gyro
+        # and absolute yaw are accurate and sufficient on their own.
+        self.odom_slip_threshold_rps = odom_slip_threshold_rps
         self._prev_heading = None
 
     def step(
@@ -93,6 +112,8 @@ class HeadingFilter:
 
         # ---- Update 1: odometry angular rate ----
         # h = (track_scale / wheel_scale) * (gyro - bias);  observed = odom_rate
+        # Skip when the wheels are slipping (odom rate grossly inconsistent with
+        # the gyro): fusing a ~2x-wrong rate would corrupt the heading.
         ws = max(wheel_scale, 1e-3)
         ratio = self.x[2] / ws
         h = ratio * (gyro_rate - self.x[1])
@@ -101,8 +122,9 @@ class HeadingFilter:
         S = float(H @ self.P @ H.T + R)
         K = self.P @ H.T / S
         y = odom_rate - h
-        self.x += K * y
-        self.P = (np.eye(3) - np.outer(K, H)) @ self.P
+        if abs(y) <= self.odom_slip_threshold_rps:
+            self.x += K * y
+            self.P = (np.eye(3) - np.outer(K, H)) @ self.P
 
         # ---- Update 2: absolute yaw (if available) ----
         if yaw is not None:
@@ -115,8 +137,14 @@ class HeadingFilter:
             self.x[0] += K2[0] * y2
             self.P = (np.eye(3) - np.outer(K2, H2)) @ self.P
 
-        # Clamp the track scale to a sane range to avoid divergence.
-        self.x[2] = float(np.clip(self.x[2], 0.5, 2.0))
+        # Clamp the gyro bias and track scale to their physical ranges so they
+        # can't diverge when loosely observed (open space).
+        self.x[1] = float(
+            np.clip(self.x[1], -self.gyro_bias_max_rps, self.gyro_bias_max_rps)
+        )
+        self.x[2] = float(
+            np.clip(self.x[2], self.track_scale_min, self.track_scale_max)
+        )
 
         # Fused heading increment for this step.
         prev = self.x[0] if self._prev_heading is None else self._prev_heading

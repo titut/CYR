@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 from core.map_format import MapData, Room, Wall
@@ -103,6 +104,19 @@ def test_anchor_fraction_preserves_rest():
     # Only ~30% were replaced; the rest still cluster near the old mean.
     ex, ey, _ = pf.estimate()
     assert math.hypot(ex - TRUE[0], ey - TRUE[1]) < 2.0
+
+
+def test_snap_absolute_makes_estimate_the_measurement():
+    # AprilTag fix is authoritative: a hard snap moves the whole cloud onto the
+    # measurement regardless of where the belief was.
+    pf = ParticleFilter(_box_map(), num_particles=200, num_beams=36)
+    pf.initialize_near(*TRUE, std_xy_m=0.5, std_theta_rad=0.2)
+    pf.snap_absolute(6.0, 4.0, 0.7, std_xy_m=0.05, std_theta_rad=0.02)
+    ex, ey, et = pf.estimate()
+    assert math.hypot(ex - 6.0, ey - 4.0) < 0.05
+    assert abs(et - 0.7) < 0.05
+    # Uniform weights: a subsequent weak scan cannot wash the fix out.
+    assert np.max(pf.weights) == pytest.approx(1.0 / pf.num_particles)
 
 
 def test_odom_scale_estimate_bounded():

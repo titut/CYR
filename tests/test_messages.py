@@ -34,6 +34,13 @@ def test_encode_stamps_version_and_round_trips():
     assert data["x_m"] == 1.0
 
 
+def test_estimate_halt_round_trip():
+    data = _round_trip(
+        "estimate/halt", {"t": 123.0, "hold_s": 1.0}
+    )
+    assert data["hold_s"] == 1.0
+
+
 def test_lidar_round_trip():
     data = _round_trip(
         "sensor/lidar",

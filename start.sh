@@ -22,13 +22,14 @@ sleep 0.2
 trap 'trap - SIGINT SIGTERM; echo "Stopping all programs..."; kill 0' SIGINT SIGTERM
 
 # 3. Start your infinite programs in the background
-python3 simulation3d/simulator.py --map home.json &
+python3 simulation3d/simulator.py --map factory.json &
 python3 zenoh/control/drive.py &
 python3 zenoh/control/controller.py &
-python3 zenoh/pose_estimation/pose_estimator.py home.json &
-python3 zenoh/navigation/navigator.py home.json &
+python3 zenoh/pose_estimation/pose_estimator.py factory.json &
+python3 zenoh/navigation/navigator.py factory.json &
 python3 zenoh/apriltag_detection/detector.py &
 python3 zenoh/logger.py &
+python3 zenoh/sim_viewer.py factory.json &
 
 # 4. Wait indefinitely for the user to stop the script
 wait

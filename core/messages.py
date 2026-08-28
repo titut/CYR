@@ -177,6 +177,14 @@ def _validate_estimate_pose(data: dict):
     _num(data, "estimate/pose", "odom_scale", required=False)
     _num(data, "estimate/pose", "track_scale", required=False)
     _num(data, "estimate/pose", "gyro_bias", required=False)
+    _num(data, "estimate/pose", "confidence", required=False)
+    _num(data, "estimate/pose", "anchor_age_s", required=False)
+    _num(data, "estimate/pose", "scan_info", required=False)
+
+
+def _validate_estimate_halt(data: dict):
+    _num(data, "estimate/halt", "t")
+    _num(data, "estimate/halt", "hold_s")
 
 
 def _validate_detection_obstacles(data: dict):
@@ -242,6 +250,7 @@ _VALIDATORS: Dict[str, Callable[[dict], None]] = {
     "cmd/velocity": _validate_cmd_velocity,
     "nav/goal": _validate_nav_goal,
     "estimate/pose": _validate_estimate_pose,
+    "estimate/halt": _validate_estimate_halt,
     "detection/obstacles": _validate_detection_obstacles,
     "safety/status": _validate_safety_status,
     "sim/truth/pose": _validate_sim_truth_pose,

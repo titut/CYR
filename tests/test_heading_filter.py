@@ -53,4 +53,17 @@ def test_track_scale_clamped():
     hf = HeadingFilter()
     for _ in range(200):
         hf.step(dt=0.1, gyro_rate=1.0, odom_rate=0.05, yaw=0.0)
-    assert 0.5 <= hf.track_scale <= 2.0
+    # Track scale is bounded to its physical range (near unity), so a wildly
+    # inconsistent odometry rate can't run it away (and corrupt the heading).
+    assert 0.9 <= hf.track_scale <= 1.1
+
+
+def test_odom_slip_is_ignored():
+    """A grossly inconsistent wheel rate (slip) must not corrupt the heading:
+    the gyro + absolute yaw stay authoritative."""
+    hf = HeadingFilter(initial_heading=0.0)
+    for _ in range(100):
+        # Gyro says 1.0 rad/s (truth), but the wheels report ~2x that (slip).
+        hf.step(dt=0.1, gyro_rate=1.0, odom_rate=2.5, yaw=None)
+    # The heading is integrated from the gyro, not the slipped odometry rate.
+    assert hf.heading == pytest.approx(10.0, abs=2.0)

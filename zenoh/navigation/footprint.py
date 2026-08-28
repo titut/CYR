@@ -32,7 +32,10 @@ def make_footprint(half_size: float, resolution: float) -> List[Tuple[int, int]]
     ``resolution`` is the grid cell size in meters.  The footprint is
     pre-computed once for reuse at every path-planner collision check.
     """
-    radius = half_size * 1.6
+    # Clearance margin: >= sqrt(2) covers the rotating square's corners; the
+    # extra headroom keeps the planned path away from walls so pose error and
+    # corner clipping do not trip the e-stop.
+    radius = half_size * 2.0
     offsets: List[Tuple[int, int]] = []
     max_cell = int(math.ceil(radius / resolution))
     for dx in range(-max_cell, max_cell + 1):

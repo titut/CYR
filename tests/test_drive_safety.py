@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from control.drive import (
@@ -11,9 +13,13 @@ from control.drive import (
     Drive,
 )
 from core.sim_drivers import _velocity_step
+from simulation.kinematics import square_footprint_radius
 
 _safety_limit = Drive._safety_limited_linear
 _safety_ang_limit = Drive._safety_limited_angular
+_directional = Drive._directional_clearance
+_heading_cap = Drive._heading_speed_cap
+_estop_action = Drive._estop_threshold_action
 
 
 # ---------------------------------------------------------------------------
@@ -97,3 +103,77 @@ def test_safety_angular_zero_in_stop_zone():
     # Rotation is halted inside the stop zone (turning could swing into a wall).
     assert _safety_ang_limit(3.0, _STOP_CLEARANCE_M) == 0.0
     assert _safety_ang_limit(-3.0, _ESTOP_CLEARANCE_M) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Heading-direction clearance + speed cap (T-016)
+# ---------------------------------------------------------------------------
+
+
+def _ray(angle_rad: float, distance_m: float) -> tuple:
+    return (angle_rad, distance_m)
+
+
+def test_directional_clearance_uses_forward_cone_only():
+    # A close obstacle dead ahead dominates; a closer one on the side is
+    # outside the travel cone and must be ignored.
+    rays = [_ray(0.0, 1.0), _ray(math.pi / 2, 0.8)]
+    got = _directional(rays, forward=True)
+    expected = 1.0 - square_footprint_radius(0.0, bot_radius_m=0.375)
+    assert got == pytest.approx(expected)
+
+
+def test_directional_clearance_reverse_cone():
+    rays = [_ray(math.pi, 1.2), _ray(0.0, 0.5)]
+    got = _directional(rays, forward=False)
+    assert got == pytest.approx(1.2 - 0.375)
+    # The close obstacle dead ahead is not relevant when reversing.
+    assert got > 0.5
+
+
+def test_directional_clearance_empty_cone_is_infinite():
+    # Rays only on the sides: nothing in the travel cone -> no cap.
+    rays = [_ray(math.pi / 2, 0.2), _ray(-math.pi / 2, 0.2)]
+    assert _directional(rays, forward=True) == float("inf")
+    assert _directional(rays, forward=False) == float("inf")
+
+
+def test_heading_speed_cap_zero_at_stop_boundary():
+    # At the stop boundary (and inside it) the cap is zero.
+    assert _heading_cap(_STOP_CLEARANCE_M, 4.0) == 0.0
+    assert _heading_cap(0.0, 4.0) == 0.0
+    assert _heading_cap(-0.1, 4.0) == 0.0
+
+
+def test_heading_speed_cap_braking_distance():
+    # sqrt(2 * a * (d - stop)): 2 m/s of braking room at 4 m/s².
+    d = _STOP_CLEARANCE_M + 0.5
+    assert _heading_cap(d, 4.0) == pytest.approx(math.sqrt(2.0 * 4.0 * 0.5))
+
+
+def test_heading_speed_cap_does_not_exceed_max_speed():
+    assert _heading_cap(10.0, 4.0, max_speed_mps=2.0) == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# E-stop threshold command triage
+# ---------------------------------------------------------------------------
+
+
+def test_estop_threshold_action_reverse_allowed():
+    assert _estop_action(-0.5, 0.0) == "reverse"
+
+
+def test_estop_threshold_action_forward_latches():
+    assert _estop_action(0.5, 0.0) == "latch"
+
+
+def test_estop_threshold_action_rotation_latches():
+    # Turning can swing the body into the hazard.
+    assert _estop_action(0.0, 1.0) == "latch"
+
+
+def test_estop_threshold_action_zero_holds_without_latching():
+    # A zero command is safe: after a reset an idle robot must not instantly
+    # re-latch (this caused the reset/re-latch storm in the field logs).
+    assert _estop_action(0.0, 0.0) == "hold"

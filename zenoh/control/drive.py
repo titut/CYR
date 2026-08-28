@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -106,6 +107,15 @@ class Drive:
         self._reverse_escape_mps = cfg.safety.reverse_escape_mps
         self._max_speed_mps = cfg.chassis.linear_speed_mps
         self._bot_radius_m = cfg.chassis.radius_m
+        # Heading-direction speed cap (T-016): cap the speed toward an obstacle
+        # in the travel cone by the plant's braking capability, so a fast robot
+        # heading at a wall is slowed down long before the clearance zones hit.
+        self._heading_decel_mps2 = (
+            cfg.drive.max_wheel_decel_rps2
+            * cfg.chassis.wheel_radius_m
+            * cfg.safety.heading_decel_safety_factor
+        )
+        self._cone_half_angle_rad = cfg.safety.heading_cone_half_angle_rad
         self._driver = load_drive_driver(cfg)
 
         self._pub_wheel = self._session.declare_publisher(
@@ -128,6 +138,9 @@ class Drive:
         # Latest minimum body-to-surface clearance (m).  Defaults to infinity
         # (no reading) so the safety zones only act on real data.
         self._min_clearance_m = float("inf")
+        # Latest scan's rays as (angle_rad, distance_m) tuples, for the
+        # heading-direction clearance.
+        self._rays: list = []
         # Latched e-stop: once set, wheels stay at zero until safety/reset.
         self._estop_latched = False
         # Last published safety state, so safety/status is only sent on change.
@@ -161,13 +174,14 @@ class Drive:
         """Store the minimum body-to-surface clearance of the latest scan."""
         try:
             scan = decode("sensor/lidar", sample)
+            rays = [
+                (float(entry["angle_rad"]), float(entry["distance_m"]))
+                for entry in scan.get("rays", [])
+            ]
             min_clearance = min(
                 (
-                    float(entry["distance_m"])
-                    - square_footprint_radius(
-                        float(entry["angle_rad"]), bot_radius_m=self._bot_radius_m
-                    )
-                    for entry in scan.get("rays", [])
+                    dist - square_footprint_radius(angle, bot_radius_m=self._bot_radius_m)
+                    for angle, dist in rays
                 ),
                 default=float("inf"),
             )
@@ -176,6 +190,7 @@ class Drive:
             return
         with self._lock:
             self._min_clearance_m = min_clearance
+            self._rays = rays
 
     def _on_reset(self, sample):
         """Clear a latched e-stop.
@@ -195,6 +210,72 @@ class Drive:
             if self._estop_latched:
                 self._estop_latched = False
                 print("[drive] E-STOP cleared by safety/reset.")
+
+    @staticmethod
+    def _directional_clearance(
+        rays,
+        forward: bool,
+        cone_half_angle_rad: float = math.pi / 3,
+        bot_radius_m: float = 0.375,
+    ) -> float:
+        """Minimum body clearance over the rays inside the travel cone.
+
+        The robot is a differential drive: it travels along its body x-axis,
+        and LIDAR rays are reported in the body frame, so "heading toward an
+        obstacle" means rays within ``cone_half_angle_rad`` of straight ahead
+        (``forward``) or straight behind (reverse).  Returns ``inf`` when no
+        ray falls in the cone (nothing relevant in that direction).
+        """
+        best = float("inf")
+        for angle, dist in rays:
+            if forward:
+                in_cone = abs(angle) <= cone_half_angle_rad
+            else:
+                rel = (angle - math.pi + math.pi) % (2.0 * math.pi) - math.pi
+                in_cone = abs(rel) <= cone_half_angle_rad
+            if in_cone:
+                body = dist - square_footprint_radius(angle, bot_radius_m=bot_radius_m)
+                if body < best:
+                    best = body
+        return best
+
+    @staticmethod
+    def _heading_speed_cap(
+        clearance_m: float,
+        decel_mps2: float,
+        stop_clearance_m: float = _STOP_CLEARANCE_M,
+        max_speed_mps: float = BOT_LINEAR_SPEED_MPS,
+    ) -> float:
+        """Max speed that can still brake to a stop at the stop boundary.
+
+        Kinematic braking distance: from speed ``v`` the robot needs
+        ``v² / (2 * decel)`` meters to stop, so the fastest safe speed toward
+        an obstacle ``clearance_m`` away (body edge to surface) is
+        ``sqrt(2 * decel * (clearance - stop_clearance))``.  The decel used is
+        the plant's max wheel decel scaled by a safety factor (config), which
+        covers scan staleness, loop latency, and plant lag.  Reaches zero
+        exactly at the stop boundary, so it composes with the existing zones
+        (take the min of the two limits).
+        """
+        speed = math.sqrt(
+            2.0 * decel_mps2 * max(0.0, clearance_m - stop_clearance_m)
+        )
+        return min(speed, max_speed_mps)
+
+    @staticmethod
+    def _estop_threshold_action(linear: float, angular: float) -> str:
+        """What to do with a command while inside the e-stop threshold.
+
+        Returns "reverse" (slow backing out is allowed), "latch" (the command
+        would drive or swing the body into the hazard), or "hold" (a zero
+        command is safe: keep the wheels at rest without re-latching, so a
+        reset while idle does not instantly re-trip).
+        """
+        if linear < 0.0:
+            return "reverse"
+        if linear > 0.0 or angular != 0.0:
+            return "latch"
+        return "hold"
 
     @staticmethod
     def _safety_limited_linear(
@@ -276,6 +357,7 @@ class Drive:
                 linear = 0.0
                 angular = 0.0
             min_clearance_m = self._min_clearance_m
+            rays = self._rays
 
         # Latched e-stop: wheels stay at zero and commands are ignored until an
         # explicit safety/reset.  This is the safety function's safe state.
@@ -295,10 +377,25 @@ class Drive:
         # still allowed so the robot can back OUT of the hazard — e.g. right
         # after a safety/reset the robot is still within the threshold, and
         # without this it would instantly re-latch and be stuck against the
-        # surface.  Any forward or rotational command re-latches.
+        # surface.  Any forward or rotational command re-latches; a zero
+        # command holds at rest without re-latching, so a reset while idle
+        # does not instantly re-trip (this caused a reset/re-latch storm).
         if min_clearance_m < self._estop_clearance_m:
-            if linear < 0.0:
-                linear = max(linear, -self._reverse_escape_mps)
+            action = self._estop_threshold_action(linear, angular)
+            if action == "reverse":
+                rear_clearance = self._directional_clearance(
+                    rays,
+                    forward=False,
+                    cone_half_angle_rad=self._cone_half_angle_rad,
+                    bot_radius_m=self._bot_radius_m,
+                )
+                rear_cap = self._heading_speed_cap(
+                    rear_clearance,
+                    self._heading_decel_mps2,
+                    stop_clearance_m=self._stop_clearance_m,
+                    max_speed_mps=self._reverse_escape_mps,
+                )
+                linear = max(linear, -rear_cap)
                 angular = 0.0
                 self._driver.set_command(linear, angular)
                 left, right = self._driver.step(dt)
@@ -310,12 +407,14 @@ class Drive:
                 )
                 self._publish_status("stop")
                 return
-            with self._lock:
-                self._estop_latched = True
-            print(
-                f"[drive] E-STOP LATCHED: clearance {min_clearance_m:.3f} m "
-                f"(< {self._estop_clearance_m} m). Send safety/reset to clear."
-            )
+            if action == "latch":
+                with self._lock:
+                    self._estop_latched = True
+                print(
+                    f"[drive] E-STOP LATCHED: clearance {min_clearance_m:.3f} m "
+                    f"(< {self._estop_clearance_m} m). Send safety/reset to clear."
+                )
+            # Latched or held: wheels at rest.
             self._driver.set_command(0.0, 0.0)
             self._driver.step(dt)
             self._pub_wheel.put(
@@ -324,7 +423,9 @@ class Drive:
                     {"left_rps": 0.0, "right_rps": 0.0, "t": time.time()},
                 )
             )
-            self._publish_status("estop_latched")
+            self._publish_status(
+                "estop_latched" if self._estop_latched else "stop"
+            )
             return
 
         # Slow-down / stop zones: scale the linear command by proximity, and
@@ -344,6 +445,28 @@ class Drive:
             slow_down_clearance_m=self._slow_down_clearance_m,
             stop_clearance_m=self._stop_clearance_m,
         )
+
+        # Heading-direction cap: when moving toward an obstacle inside the
+        # travel cone, the speed is further limited by the braking capability
+        # (v_max = sqrt(2 * decel * clearance)), so a fast robot heading at a
+        # wall is slowed on a feasible decel curve instead of relying on the
+        # clearance ramp alone.  Moving parallel to or away from a surface is
+        # not capped by this (the zones still apply).
+        if linear != 0.0:
+            heading_clearance = self._directional_clearance(
+                rays,
+                forward=linear > 0.0,
+                cone_half_angle_rad=self._cone_half_angle_rad,
+                bot_radius_m=self._bot_radius_m,
+            )
+            cap = self._heading_speed_cap(
+                heading_clearance,
+                self._heading_decel_mps2,
+                stop_clearance_m=self._stop_clearance_m,
+                max_speed_mps=self._max_speed_mps,
+            )
+            if cap < abs(linear):
+                linear = math.copysign(cap, linear)
 
         # Command the configured drive driver (sim/logging/...) and read the
         # measured wheel speeds back.

@@ -89,6 +89,13 @@ class SafetyConfig:
     stop_clearance_m: float = 0.15
     estop_clearance_m: float = 0.05
     reverse_escape_mps: float = 0.5  # slow reverse allowed inside the stop zone
+    # Heading-direction speed cap: the max safe speed toward an obstacle in
+    # the travel direction is sqrt(2 * decel * clearance), where decel is the
+    # plant's max wheel decel times this safety factor (covers detection
+    # latency, scan staleness, and plant lag).
+    heading_decel_safety_factor: float = 0.5
+    # Rays within this angle of the travel direction count as "ahead".
+    heading_cone_half_angle_rad: float = math.pi / 3
 
 
 @dataclass
@@ -269,7 +276,13 @@ def _validate(cfg: RobotConfig):
 
     if cfg.drive.max_wheel_accel_rps2 < 0 or cfg.drive.max_wheel_decel_rps2 < 0:
         raise ConfigError("drive accel/decel limits must be non-negative")
-    for name in ("slow_down_clearance_m", "stop_clearance_m", "estop_clearance_m"):
+    for name in (
+        "slow_down_clearance_m",
+        "stop_clearance_m",
+        "estop_clearance_m",
+        "heading_decel_safety_factor",
+        "heading_cone_half_angle_rad",
+    ):
         if getattr(cfg.safety, name) <= 0:
             raise ConfigError(f"safety.{name} must be positive")
 

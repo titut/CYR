@@ -41,8 +41,10 @@ if str(_ZENOH_DIR) not in sys.path:
 from core.messages import SchemaError, decode, encode
 
 
-# Simulated image-processing time per detection (seconds).
-DETECTION_PROCESSING_S = 0.08
+# Simulated image-processing time per detection (seconds).  Matches the camera
+# frame rate so detections arrive at ~30 Hz (the pose estimator anchors at the
+# camera rate).
+DETECTION_PROCESSING_S = 1.0 / 30.0
 
 
 class ApriltagDetector:

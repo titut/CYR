@@ -91,7 +91,8 @@ def read_imu(
     """IMU reading from the base's rigid-body state (same schema as the 2D sim)."""
     pos, orn = p.getBasePositionAndOrientation(base_uid)
     yaw = p.getEulerFromQuaternion(orn)[2]
-    ang_vel, lin_vel = p.getBaseVelocity(base_uid)
+    # getBaseVelocity returns (linear_velocity, angular_velocity).
+    lin_vel, ang_vel = p.getBaseVelocity(base_uid)
     imu = cfg.sensors.imu
 
     noisy_yaw = _wrap_angle(yaw + random.gauss(0.0, imu.yaw_noise_rad))

@@ -11,7 +11,7 @@ from navigation.footprint import make_footprint
 # The footprint is a circle whose radius is this multiple of the half-size.
 # >= sqrt(2) guarantees clearance for the rotating square's corners; the extra
 # margin is a clearance tuning knob.
-_FOOTPRINT_RADIUS_FACTOR = 1.6
+_FOOTPRINT_RADIUS_FACTOR = 2.0
 
 
 def test_footprint_is_a_circle_not_a_box():
@@ -43,9 +43,9 @@ def test_footprint_covers_the_disc_axes():
 def test_footprint_size_regression():
     """Exact cell count for the 0.75 m bot at 0.25 m resolution."""
     fp = make_footprint(0.375, 0.25)
-    # Circle of radius 0.6 m at 0.25 m cells = 21 cells (was 49 for the box).
-    assert len(fp) == 21
-    assert max(max(abs(dx), abs(dy)) for dx, dy in fp) == 2
+    # Circle of radius 0.75 m at 0.25 m cells = 29 cells.
+    assert len(fp) == 29
+    assert max(max(abs(dx), abs(dy)) for dx, dy in fp) == 3
 
 
 def test_footprint_scales_with_resolution():

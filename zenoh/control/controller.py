@@ -273,6 +273,10 @@ class Controller:
         self._est_y = 0.0
         self._est_theta = 0.0
 
+        # Monotonic time until which the robot must hold position (a
+        # localization jump was detected in the pose stream).
+        self._halt_until: float = 0.0
+
         # Current path and progress along it.
         self._path: List[Tuple[float, float]] = []
 
@@ -293,6 +297,9 @@ class Controller:
 
         self._sub_pose = self._session.declare_subscriber(
             "estimate/pose", self._on_pose
+        )
+        self._sub_halt = self._session.declare_subscriber(
+            "estimate/halt", self._on_halt
         )
         self._sub_path = self._session.declare_subscriber("nav/path", self._on_path)
         self._sub_wasd = self._session.declare_subscriber("sensor/wasd", self._on_wasd)
@@ -327,6 +334,19 @@ class Controller:
             self._last_pose_x, self._last_pose_y = x, y
             self._last_pose_theta = theta
             self._last_pose_time = now
+
+    def _on_halt(self, sample):
+        """Localization-jump halt command from the pose estimator: hold position
+        for the requested duration so the corrected pose can settle."""
+        try:
+            data = decode("estimate/halt", sample)
+            hold_s = float(data["hold_s"])
+        except SchemaError as exc:
+            logging.warning("estimate/halt dropped: %s", exc)
+            return
+        with self._lock:
+            self._halt_until = time.monotonic() + hold_s
+            logging.warning("estimate/halt received — holding for %.2f s.", hold_s)
 
     def _on_path(self, sample):
         try:
@@ -600,11 +620,16 @@ class Controller:
         with self._lock:
             keys = dict(self._keys)
             x, y, theta = self._est_x, self._est_y, self._est_theta
+            halt = time.monotonic() < self._halt_until
 
             if any(keys.values()):
                 # Teleop priority: cancel path following and drive from keys.
                 self._path = []
                 target_lin, target_ang = self._wasd_to_velocity(keys)
+            elif halt:
+                # A localization jump was just absorbed: hold position and keep
+                # the path so motion resumes once the pose has settled.
+                target_lin, target_ang = 0.0, 0.0
             elif not self._path:
                 target_lin, target_ang = 0.0, 0.0
             else:

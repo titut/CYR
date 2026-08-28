@@ -4,6 +4,7 @@ Subscribes to:
     estimate/pose  — estimated pose from pose_estimator (meters)
     nav/goal       — user-clicked target in meters
     nav/command    — natural-language navigation command
+    safety/status  — drive node's safety state (e-stop awareness)
 
 Publishes:
     nav/path           — planned waypoints as JSON list of [x, y] pairs (meters)
@@ -45,6 +46,7 @@ from core.map_format import MapData, new_empty_map
 from core.messages import SchemaError, decode, decode_text, encode
 from core.robot_config import get_robot_config
 from simulation.occupancy_grid import OccupancyGrid, _bresenham_line
+from simulation.kinematics import square_footprint_radius
 from navigation.astar import plan_path
 from navigation.footprint import make_footprint
 from navigation.llm_nav import query_location_async
@@ -78,6 +80,23 @@ _LO_DECAY = 0.05          # per-update pull toward 0 so stale cells fade
 _MAX_RANGE_MARGIN_M = 0.1
 
 _CHECK_INTERVAL_S = 0.25  # how often to scan and (maybe) replan
+
+# Pose-recovery behavior: when the pose estimator reports low confidence for a
+# sustained stretch — a stale AprilTag anchor combined with a blind (open-space)
+# LIDAR scan — the robot sets its current task aside, drives to the nearest
+# AprilTag to re-anchor, and resumes the task once confidence recovers.
+RECOVERY_CONFIDENCE_TRIGGER = 0.35  # enter recovery below this confidence
+RECOVERY_CONFIDENCE_CLEAR = 0.60    # resume the task above this confidence
+RECOVERY_DEBOUNCE_S = 3.0           # must stay below trigger this long
+RECOVERY_CLEAR_DEBOUNCE_S = 3.0     # must stay above clear this long
+RECOVERY_MAX_TAG_TRIES = 3          # nearest tags to try routing to in A*
+
+
+def sort_tags_by_distance(
+    tags: List[Tuple[float, float]], x: float, y: float
+) -> List[Tuple[float, float]]:
+    """AprilTag positions sorted by straight-line distance from (x, y)."""
+    return sorted(tags, key=lambda p: math.hypot(p[0] - x, p[1] - y))
 
 
 def update_occupancy_log_odds(
@@ -135,6 +154,35 @@ def update_occupancy_log_odds(
     np.clip(lo, -_LO_MAX, _LO_MAX, out=lo)
 
     return lo > _LO_OCCUPIED
+
+
+def mark_hazard_log_odds(
+    dyn_log_odds: np.ndarray,
+    walls_grid: OccupancyGrid,
+    x: float,
+    y: float,
+    theta: float,
+    bot_radius_m: float,
+    resolution: float,
+) -> None:
+    """Saturate the log-odds of the cells directly ahead of the robot.
+
+    Used after a latched e-stop: the obstacle that tripped it is directly
+    ahead of the body but may not be in the dynamic map yet, so the next plan
+    would route straight back into it.  Saturating (not incrementing) makes
+    the hazard survive the per-update decay for ~12 s; a real obstacle is
+    re-observed by later scans, a ghost fades away.
+    """
+    dist = bot_radius_m + 0.25  # hazard centre roughly at the body edge
+    hx = x + dist * math.cos(theta)
+    hy = y + dist * math.sin(theta)
+    r_cells = max(1, int(round(0.25 / resolution)))
+    gcx, gcy = walls_grid.world_to_grid(hx, hy)
+    rows, cols = dyn_log_odds.shape
+    for gy in range(gcy - r_cells, gcy + r_cells + 1):
+        for gx in range(gcx - r_cells, gcx + r_cells + 1):
+            if 0 <= gx < cols and 0 <= gy < rows:
+                dyn_log_odds[gy, gx] = _LO_MAX
 
 
 def closest_segment_index(path, x: float, y: float) -> int:
@@ -208,6 +256,21 @@ class Navigator:
         # Current navigation target.
         self._nav_target: Optional[Tuple[float, float]] = None
 
+        # Pose-recovery state: when estimate/pose confidence is low (stale
+        # AprilTag anchor + blind LIDAR), the robot sets its task aside and
+        # drives to the nearest AprilTag to re-anchor.
+        self._est_confidence: float = 1.0
+        self._recovering: bool = False
+        self._saved_target: Optional[Tuple[float, float]] = None
+        self._recovery_target: Optional[Tuple[float, float]] = None
+        self._low_conf_since: Optional[float] = None
+        self._high_conf_since: Optional[float] = None
+
+        # E-stop awareness (safety/status from the drive node): while latched,
+        # drop the path and hold replanning until clear of the hazard zone.
+        self._estop_active: bool = False
+        self._estop_clearance_m = cfg.safety.estop_clearance_m
+
         # LLM API key.
         self._api_key = os.environ.get("DEEPSEEK_API_KEY", "")
 
@@ -246,6 +309,11 @@ class Navigator:
             "sensor/lidar", self._on_lidar
         )
 
+        # Subscriber: drive node's safety state (e-stop awareness).
+        self._sub_safety = self._session.declare_subscriber(
+            "safety/status", self._on_safety
+        )
+
     @staticmethod
     def _load_map(path: Path) -> MapData:
         if not path.exists():
@@ -264,6 +332,9 @@ class Navigator:
             self._est_x = float(data["x_m"])
             self._est_y = float(data["y_m"])
             self._est_theta = float(data["theta_rad"])
+            # Confidence (0..1) from the estimator's recovery model; defaults
+            # to 1.0 when a publisher does not send it.
+            self._est_confidence = float(data.get("confidence", 1.0))
         except SchemaError as exc:
             logging.warning("estimate/pose dropped: %s", exc)
 
@@ -277,6 +348,69 @@ class Navigator:
         with self._lidar_lock:
             self._latest_lidar = scan
 
+    def _on_safety(self, sample):
+        """Track the drive node's safety state (e-stop awareness)."""
+        try:
+            data = decode("safety/status", sample)
+        except SchemaError as exc:
+            logging.warning("safety/status dropped: %s", exc)
+            return
+        if str(data.get("state", "")) == "estop_latched":
+            self._handle_estop()
+
+    def _handle_estop(self):
+        """React to a latched e-stop.
+
+        The re-latch storm in the field logs was the navigator re-commanding
+        forward the instant the operator reset the e-stop, latching it again.
+        So on latch: drop the path (the controller idles at zero velocity —
+        a zero command does not re-latch the drive node), mark the obstacle
+        that tripped the e-stop into the occupancy grid, and hold all
+        replanning until the robot is clear of the hazard zone (see run()).
+        """
+        if self._estop_active:
+            return
+        self._estop_active = True
+        logging.warning(
+            "E-stop latched: dropping path and marking the hazard ahead."
+        )
+        self._current_path = []
+        self._pub_path.put(json.dumps([]))
+        self._mark_hazard_ahead()
+
+    def _mark_hazard_ahead(self):
+        """Mark the cells in front of the robot as occupied (log-odds saturation)."""
+        mark_hazard_log_odds(
+            self._dyn_log_odds,
+            self._walls_grid,
+            self._est_x,
+            self._est_y,
+            self._est_theta,
+            self.bot_radius,
+            self._grid_resolution,
+        )
+
+    def _inside_estop_zone(self) -> bool:
+        """Whether the latest LIDAR scan still shows an obstacle inside the
+        e-stop threshold.  Used to hold replanning after an e-stop until the
+        robot (or operator) has backed out of the hazard.  No scan yet counts
+        as clear so the navigator cannot deadlock on missing data."""
+        with self._lidar_lock:
+            scan = self._latest_lidar
+        if not scan:
+            return False
+        min_clearance = min(
+            (
+                float(r["distance_m"])
+                - square_footprint_radius(
+                    float(r["angle_rad"]), bot_radius_m=self.bot_radius
+                )
+                for r in scan.get("rays", [])
+            ),
+            default=float("inf"),
+        )
+        return min_clearance < self._estop_clearance_m
+
     def _on_goal(self, sample):
         """A user clicked a point on the map. Plan a path to it."""
         try:
@@ -288,6 +422,9 @@ class Navigator:
 
         self._nav_target = target
         self._current_path = []
+
+        # An explicit goal overrides any in-progress pose recovery.
+        self._cancel_recovery()
 
         logging.info("Goal received: (%.2f, %.2f) m", target[0], target[1])
         # Plan immediately, but include any currently-visible obstacle particles
@@ -311,6 +448,9 @@ class Navigator:
             if target_m is not None:
                 self._nav_target = target_m
                 self._current_path = []
+
+                # An explicit command overrides any in-progress pose recovery.
+                self._cancel_recovery()
 
                 logging.info(
                     "LLM resolved to: (%.2f, %.2f) m",
@@ -511,6 +651,104 @@ class Navigator:
             self._plan_and_publish()
 
     # -------------------------------------------------------------------
+    # Pose recovery (re-localize at the nearest AprilTag)
+    # -------------------------------------------------------------------
+
+    def _cancel_recovery(self):
+        """Abort pose recovery (e.g. an explicit new goal arrived)."""
+        self._recovering = False
+        self._saved_target = None
+        self._recovery_target = None
+        self._low_conf_since = None
+        self._high_conf_since = None
+
+    def _nearest_tag_targets(self) -> List[Tuple[float, float]]:
+        """AprilTag positions sorted by straight-line distance from the robot."""
+        tags = [(t.x, t.y) for t in self.map_data.apriltags]
+        return sort_tags_by_distance(tags, self._est_x, self._est_y)
+
+    def _pick_recovery_target(self) -> Optional[Tuple[float, float]]:
+        """The nearest AprilTag that A* can actually route to."""
+        for target in self._nearest_tag_targets()[:RECOVERY_MAX_TAG_TRIES]:
+            path = plan_path(
+                self.occ_grid,
+                (self._est_x, self._est_y),
+                target,
+                self._bot_footprint,
+            )
+            if path:
+                return target
+        return None
+
+    def _enter_recovery(self):
+        """Stop the current task and plan to the nearest AprilTag to re-anchor."""
+        self._saved_target = self._nav_target
+        self._nav_target = None
+        self._current_path = []
+        self._recovering = True
+        self._low_conf_since = None
+        self._high_conf_since = None
+        self._recovery_target = self._pick_recovery_target()
+        if self._recovery_target is None:
+            logging.error("Pose recovery: no reachable AprilTag to re-anchor at.")
+            return
+        logging.warning(
+            "Localization confidence low (%.2f); seeking AprilTag at "
+            "(%.1f, %.1f) to re-anchor.",
+            self._est_confidence,
+            self._recovery_target[0],
+            self._recovery_target[1],
+        )
+        self._nav_target = self._recovery_target
+        self._plan_fresh(force=True)
+
+    def _exit_recovery(self):
+        """Resume the task saved when recovery started."""
+        logging.info(
+            "Localization confidence recovered (%.2f); resuming task at %s.",
+            self._est_confidence,
+            self._saved_target,
+        )
+        target = self._saved_target
+        self._cancel_recovery()
+        self._nav_target = target
+        self._current_path = []
+        if self._nav_target is not None:
+            self._plan_fresh(force=True)
+
+    def _update_recovery_state(self) -> bool:
+        """Drive the pose-recovery state machine.
+
+        Returns True while a recovery is in progress (the caller should skip
+        the normal task replan).  Enters recovery after low confidence persists
+        for RECOVERY_DEBOUNCE_S; exits back to the saved task after confidence
+        clears for RECOVERY_CLEAR_DEBOUNCE_S.
+        """
+        now = time.monotonic()
+        conf = self._est_confidence
+
+        if self._recovering:
+            if conf >= RECOVERY_CONFIDENCE_CLEAR:
+                if self._high_conf_since is None:
+                    self._high_conf_since = now
+                elif now - self._high_conf_since >= RECOVERY_CLEAR_DEBOUNCE_S:
+                    self._exit_recovery()
+            else:
+                self._high_conf_since = None
+            if self._recovering:
+                self._check_and_replan()
+            return True
+
+        if conf < RECOVERY_CONFIDENCE_TRIGGER:
+            if self._low_conf_since is None:
+                self._low_conf_since = now
+            elif now - self._low_conf_since >= RECOVERY_DEBOUNCE_S:
+                self._enter_recovery()
+        else:
+            self._low_conf_since = None
+        return self._recovering
+
+    # -------------------------------------------------------------------
     # Main loop
     # -------------------------------------------------------------------
 
@@ -519,7 +757,20 @@ class Navigator:
         next_tick = time.monotonic()
         try:
             while True:
-                self._check_and_replan()
+                # While an e-stop is latched (or the robot is still inside the
+                # e-stop clearance after a reset), hold the empty path: any
+                # command would drive straight back into the hazard.  Resume
+                # normal planning once the latest scan shows the zone clear.
+                if self._estop_active:
+                    if not self._inside_estop_zone():
+                        self._estop_active = False
+                        logging.info(
+                            "E-stop: clear of hazard zone; resuming navigation."
+                        )
+                # While recovering, the recovery state machine owns the replan
+                # cycle; the normal task replan is skipped.
+                elif not self._update_recovery_state():
+                    self._check_and_replan()
                 # Deadline-driven pacing (no cumulative drift from jitter).
                 next_tick += _CHECK_INTERVAL_S
                 sleep_until(next_tick)
