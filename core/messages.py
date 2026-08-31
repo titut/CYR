@@ -177,8 +177,6 @@ def _validate_estimate_pose(data: dict):
     _num(data, "estimate/pose", "odom_scale", required=False)
     _num(data, "estimate/pose", "track_scale", required=False)
     _num(data, "estimate/pose", "gyro_bias", required=False)
-    _num(data, "estimate/pose", "confidence", required=False)
-    _num(data, "estimate/pose", "anchor_age_s", required=False)
     _num(data, "estimate/pose", "scan_info", required=False)
 
 
